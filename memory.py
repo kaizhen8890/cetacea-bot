@@ -241,7 +241,9 @@ def erase_user(db,guild,user):
     db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
 
 
-def status(db):
-    pending=db.execute('SELECT count(*) n,max(created) newest FROM journal WHERE processed=0').fetchone()
-    summary=db.execute('SELECT count(*) n,max(created) newest FROM auto_memories').fetchone()
+def status(db,guild):
+    pending=db.execute('''SELECT count(*) n,max(created) newest FROM journal
+        WHERE guild=? AND processed=0''',(str(guild),)).fetchone()
+    summary=db.execute('''SELECT count(*) n,max(created) newest FROM auto_memories
+        WHERE guild=?''',(str(guild),)).fetchone()
     return {'pending':pending['n'],'summaries':summary['n'],'last_summary':summary['newest']}

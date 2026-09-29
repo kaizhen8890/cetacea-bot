@@ -252,8 +252,8 @@ class Whale(discord.Client):
             rows=self.personal_memories(m)
             reply='本服务器里你主动保存且本频道可用的记忆：\n'+('\n'.join(f'{r["key"]}={r["value"]}' for r in rows) or '暂无。')
         elif cmd=='记忆状态':
-            info=memory_status(self.store.db)
-            reply=(f'本地已整理 {info["summaries"]} 条摘要；还有 {info["pending"]} 条消息待整理。'
+            info=memory_status(self.store.db,m.guild.id)
+            reply=(f'本服务器已整理 {info["summaries"]} 条摘要；还有 {info["pending"]} 条消息待整理。'
                    '整理仅使用本地模型，电脑忙或模型未安装时会延后。')
         elif cmd.startswith('记住 '):
             if not self.memory_on(m):

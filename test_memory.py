@@ -1,7 +1,7 @@
 import sqlite3
 import unittest
 
-from memory import install,record,next_batch,save_summary,retrieve,erase_user,erase_message,save_long,pending_fold
+from memory import install,record,next_batch,save_summary,retrieve,erase_user,erase_message,save_long,pending_fold,status
 
 
 class MemoryTests(unittest.TestCase):
@@ -71,6 +71,12 @@ class MemoryTests(unittest.TestCase):
                 VALUES('10','100','glance','大家聊晚饭','["晚饭"]','[]','[]',1,?)''',(i+2,))
         self.assertEqual(retrieve(self.db,10,200,7,'鲸鱼有什么好看的'),[
             {'kind':'long','text':'小明喜欢看鲸鱼','channel':'100'}])
+
+    def test_status_only_counts_current_server(self):
+        record(self.db,1,10,100,7,'小明','第一个服务器',created=100)
+        record(self.db,2,20,200,8,'小红','第二个服务器',created=100)
+        self.assertEqual(status(self.db,10)['pending'],1)
+        self.assertEqual(status(self.db,20)['pending'],1)
 
 
 if __name__=='__main__':
