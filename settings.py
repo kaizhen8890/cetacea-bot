@@ -38,6 +38,9 @@ def configured_servers(c):
 def load_settings(require_discord=False):
     load_dotenv(ROOT / '.env')
     c = json.loads((ROOT / 'config.json').read_text(encoding='utf-8-sig'))
+    c.setdefault('auto_memory_enabled',False)
+    c.setdefault('local_memory_model','qwen3.5:2b-q4_K_M')
+    c.setdefault('auto_memory_prompt',True)
     for name in ('daily_budget_rmb', 'input_usd_per_million', 'output_usd_per_million',
                  'usd_to_rmb', 'cost_margin', 'api_timeout_seconds'):
         if not isinstance(c[name], (int, float)) or not math.isfinite(c[name]) or c[name] <= 0:

@@ -27,5 +27,8 @@
   "conversation_followup_seconds": 120,
   "api_timeout_seconds": 45,
   "memory_enabled": true,
-  "memory_max_items": 12
+  "memory_max_items": 12,
+  "auto_memory_enabled": false,
+  "local_memory_model": "qwen3.5:2b-q4_K_M",
+  "auto_memory_prompt": true
 }

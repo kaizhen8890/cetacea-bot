@@ -62,6 +62,9 @@ def main():
     servers_box.pack(fill='x')
     servers_box.insert('1.0',format_server_lines(configured_servers(c)))
     ttk.Label(frame,text='手动格式：服务器ID: 频道ID, 频道ID',foreground='#777777').pack(anchor='w',pady=(3,0))
+    auto_memory=tk.BooleanVar(value=c.get('auto_memory_enabled',False))
+    ttk.Checkbutton(frame,text='记录已选频道消息，并用本地 Qwen 定时整理记忆（需另行安装 Ollama 模型）',
+                    variable=auto_memory).pack(anchor='w',pady=(9,0))
     status=tk.StringVar(value='每天 ¥2 预算由所有所选服务器共用，保留 10% 余量；保存后重启生效。')
     ttk.Label(frame,textvariable=status,wraplength=690).pack(anchor='w',pady=16)
 
@@ -166,7 +169,8 @@ def main():
                     raise ValueError(f'机器人看不到服务器 {guild_id} 的某个选定文字频道。')
                 for channel_id in entry['channel_ids']:
                     request('/channels/'+str(channel_id)+'/messages?limit=1')
-            c.update(servers=servers,owner_id=int(owner or '0'))
+            c.update(servers=servers,owner_id=int(owner or '0'),
+                     auto_memory_enabled=auto_memory.get())
             c.pop('guild_id',None)
             c.pop('channel_ids',None)
             set_key(str(ROOT/'.env'),'DISCORD_TOKEN',token)

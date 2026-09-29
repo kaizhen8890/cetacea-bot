@@ -4,6 +4,8 @@ import logging
 import logging.handlers
 import re
 import socket
+import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 import aiohttp
@@ -11,16 +13,18 @@ import discord
 from settings import ROOT, load_settings
 from storage import Store, BudgetExceeded
 from engine import Context, Policy, ConversationTracker, LLM, APIError, clip, safe_text, explanation_request, choose_emote, EMOTE_NAMES
+from memory import record as record_memory, mark_engaged, retrieve as retrieve_memory, erase_message, erase_user, status as memory_status, next_batch, pending_fold
+from memory_worker import model_ready, resource_ready
 
 LOG=logging.getLogger('cetacea')
 HELP=('🐳 我是 DeepSeek 鲸鱼娘。@我或回复我开始聊天；我会接上两分钟内的自然追问。平时也会偶尔插话、用群内表情。\n'
       '本地命令（不调用模型）：\n'
       '`!鲸鱼 状态` · `!鲸鱼 帮助`\n'
       '`!鲸鱼 记住 称呼=小明`（同名覆盖，可用于纠正）\n'
-      '`!鲸鱼 记忆` · `!鲸鱼 忘记 称呼` · `!鲸鱼 清空记忆`\n'
+      '`!鲸鱼 记忆` · `!鲸鱼 记忆状态` · `!鲸鱼 忘记 称呼` · `!鲸鱼 清空记忆`\n'
       '`!鲸鱼 关闭记忆` · `!鲸鱼 开启记忆`\n'
       '管理员：`!鲸鱼 暂停`、`!鲸鱼 恢复`、`!鲸鱼 清空上下文`\n'
-      '记忆仅用于你在当前频道的聊天；关闭记忆会删除你的已存记忆和缓存发言。\n'
+      '自动记忆在同一服务器的公开频道间共享；受限频道只留在本频道。关闭记忆会清除你在本服务器的已存发言与摘要。\n'
       '回复时会将当前发言、少量频道上下文和相关记忆发送至配置的模型供应商。')
 
 class Whale(discord.Client):
@@ -44,12 +48,18 @@ class Whale(discord.Client):
         self.last_notice={}
         self.available_emotes={}
         self.session=None
+        self.memory_task=None
 
     async def setup_hook(self):
         self.session=aiohttp.ClientSession()
         self.llm=LLM(self.c,self.store,self.session)
+        if self.c['auto_memory_enabled']:
+            self.memory_task=asyncio.create_task(self.memory_scheduler())
 
     async def close(self):
+        if self.memory_task:
+            self.memory_task.cancel()
+            await asyncio.gather(self.memory_task,return_exceptions=True)
         for task in list(self.workers.values()):
             task.cancel()
         if self.workers:
@@ -94,10 +104,54 @@ class Whale(discord.Client):
         return (m.author.id==int(self.c['owner_id']) or m.author.guild_permissions.manage_guild)
 
     def memory_key(self,m):
-        return f'memory_off:{m.guild.id}:{m.channel.id}:{m.author.id}'
+        return f'memory_off:{m.guild.id}:{m.author.id}'
 
     def memory_on(self,m):
-        return self.c['memory_enabled'] and self.store.pref(self.memory_key(m))!='1'
+        return (self.c['memory_enabled'] and self.store.pref(self.memory_key(m))!='1'
+                and self.store.pref(f'memory_off:{m.guild.id}:{m.channel.id}:{m.author.id}')!='1')
+
+    def shareable(self,channel):
+        return bool(channel.permissions_for(channel.guild.default_role).view_channel)
+
+    def personal_memories(self,m):
+        rows=[]
+        for r in self.store.guild_memories(m.guild.id,m.author.id):
+            source=self.get_channel(int(r['channel']))
+            if r['channel']==str(m.channel.id) or (source and self.shareable(source)):
+                rows.append({'key':r['key'],'value':r['value']})
+        return rows[:5]
+
+    async def memory_scheduler(self):
+        await asyncio.sleep(90)
+        while True:
+            try:
+                defer=float(self.store.pref('memory_defer_until','0'))
+                due=next_batch(self.store.db) or any(
+                    len(pending_fold(self.store.db,gid))>=10 for gid in self.allowed_channels)
+                if time.time()>=defer and due and (
+                        await asyncio.to_thread(model_ready,self.c['local_memory_model'])) and (
+                        await asyncio.to_thread(resource_ready)):
+                    code=0
+                    if self.c['auto_memory_prompt']:
+                        proc=await asyncio.create_subprocess_exec(sys.executable,str(ROOT/'memory_worker.py'),
+                            '--prompt',cwd=str(ROOT),stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL)
+                        code=await proc.wait()
+                    delays={1:1800,2:7200,3:86400}
+                    if code in delays:
+                        self.store.set_pref('memory_defer_until',str(time.time()+delays[code]))
+                    elif code==0 and await asyncio.to_thread(resource_ready):
+                        proc=await asyncio.create_subprocess_exec(sys.executable,str(ROOT/'memory_worker.py'),
+                            '--run',self.c['local_memory_model'],cwd=str(ROOT),
+                            stdout=asyncio.subprocess.DEVNULL,stderr=asyncio.subprocess.DEVNULL)
+                        if await proc.wait()!=0:
+                            LOG.warning('本地记忆整理暂时失败；原始记录保留待重试')
+                            self.store.set_pref('memory_defer_until',str(time.time()+3600))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOG.warning('本地记忆调度暂停：%s',type(exc).__name__)
+            await asyncio.sleep(300)
 
     def history_key(self,m,uid=None):
         return f'history_after:{m.guild.id}:{m.channel.id}:{m.author.id if uid is None else uid}'
@@ -108,13 +162,21 @@ class Whale(discord.Client):
     def _historical_allowed(self,m,old):
         if old.channel.id!=m.channel.id or not old.content.strip():
             return False
+        own_reset=self.store.pref(f'memory_reset_at:{m.guild.id}:{m.author.id}')
+        if own_reset and getattr(old,'created_at',None) and old.created_at.timestamp()<=float(own_reset):
+            return False
         if old.author.bot and old.author.id!=self.user.id:
             return False
         if old.content.strip().startswith('!鲸鱼'):
             return False
-        if not old.author.bot and self.store.pref(
-                f'memory_off:{m.guild.id}:{m.channel.id}:{old.author.id}')=='1':
+        if not old.author.bot and (self.store.pref(
+                f'memory_off:{m.guild.id}:{old.author.id}')=='1' or self.store.pref(
+                f'memory_off:{m.guild.id}:{m.channel.id}:{old.author.id}')=='1'):
             return False
+        if not old.author.bot:
+            reset=self.store.pref(f'memory_reset_at:{m.guild.id}:{old.author.id}')
+            if reset and getattr(old,'created_at',None) and old.created_at.timestamp()<=float(reset):
+                return False
         for key in (self.context_key(m),self.history_key(m,old.author.id)):
             value=self.store.pref(key)
             if value and value!='off' and old.id<=int(value):
@@ -187,8 +249,12 @@ class Whale(discord.Client):
                    '同一位群友的自然追问无需再次 @。\n'
                    '按 UTC+8 零点换日，实际账单以供应商为准。')
         elif cmd=='记忆':
-            rows=self.store.memories(*scope)
-            reply='当前频道中你保存的记忆：\n'+('\n'.join(f'{r["key"]}={r["value"]}' for r in rows) or '暂无。')
+            rows=self.personal_memories(m)
+            reply='本服务器里你主动保存且本频道可用的记忆：\n'+('\n'.join(f'{r["key"]}={r["value"]}' for r in rows) or '暂无。')
+        elif cmd=='记忆状态':
+            info=memory_status(self.store.db)
+            reply=(f'本地已整理 {info["summaries"]} 条摘要；还有 {info["pending"]} 条消息待整理。'
+                   '整理仅使用本地模型，电脑忙或模型未安装时会延后。')
         elif cmd.startswith('记住 '):
             if not self.memory_on(m):
                 reply='记忆已关闭，先用 !鲸鱼 开启记忆。'
@@ -198,7 +264,7 @@ class Whale(discord.Client):
                 key,value=cmd[3:].split('=',1)
                 try:
                     self.store.remember(*scope,safe_text(key),safe_text(value),self.c['memory_max_items'])
-                    reply='记住啦，下次在这个频道聊天会用到；同名记忆已更新。'
+                    reply='记住啦；公开频道的记忆在本服务器里也能用到。'
                 except ValueError as exc:
                     reply=str(exc)
         elif cmd.startswith('忘记 '):
@@ -207,8 +273,10 @@ class Whale(discord.Client):
             self.store.set_pref(self.history_key(m),str(m.id))
             reply='这条记忆已删除，也清掉了你的近期发言上下文。'
         elif cmd in ('清空记忆','关闭记忆'):
-            self.store.forget(*scope)
-            self.context.forget_user(m.channel.id,m.author.id)
+            erase_user(self.store.db,m.guild.id,m.author.id)
+            self.store.set_pref(f'memory_reset_at:{m.guild.id}:{m.author.id}',str(time.time()))
+            for channel_id in self.allowed_channels.get(m.guild.id,()):
+                self.context.forget_user(channel_id,m.author.id)
             if self.dialogue.active.get(m.channel.id,(None,))[0]==m.author.id:
                 self.dialogue.clear(m.channel.id)
             self.store.set_pref(self.history_key(m),str(m.id))
@@ -218,12 +286,14 @@ class Whale(discord.Client):
                 task.cancel()
             if cmd=='关闭记忆':
                 self.store.set_pref(self.memory_key(m),'1')
-            reply='你的本频道记忆和近期发言缓存已清空。'+('记忆已关闭。' if cmd=='关闭记忆' else '')
+            reply='你在本服务器的本地记忆和记录已清空。'+('记忆已关闭。' if cmd=='关闭记忆' else '')
         elif cmd=='开启记忆':
             if not self.c['memory_enabled']:
                 reply='管理员在本机关闭了全部记忆。'
             else:
                 self.store.set_pref(self.memory_key(m),'0')
+                for channel_id in self.allowed_channels.get(m.guild.id,()):
+                    self.store.set_pref(f'memory_off:{m.guild.id}:{channel_id}:{m.author.id}','0')
                 reply='记忆已开启，可以用 !鲸鱼 记住 名称=内容 保存。'
         elif cmd in ('暂停','恢复','清空上下文'):
             if not self.admin(m):
@@ -269,6 +339,10 @@ class Whale(discord.Client):
         else:
             followup=self.dialogue.is_followup(m.channel.id,m.author.id,clean,
                 reply_to_other=m.reference is not None,mention_other=bool(m.mentions))
+        if self.c['auto_memory_enabled'] and self.memory_on(m):
+            record_memory(self.store.db,m.id,m.guild.id,m.channel.id,m.author.id,
+                m.author.display_name,safe_text(text),engaged=direct or followup,
+                public=self.shareable(m.channel))
         # Short-term context is volatile. Opt-out also excludes future passive caching.
         if self.memory_on(m):
             self.context.add(m.channel.id,m.id,m.author.id,m.author.display_name,clean)
@@ -310,7 +384,7 @@ class Whale(discord.Client):
                     m=batch[-1][0]
                     if self.store.pref(f'paused:{m.channel.id}')=='1':
                         return
-                    memories=self.store.memories(m.guild.id,m.channel.id,m.author.id)[:5] if self.memory_on(m) else []
+                    memories=self.personal_memories(m) if self.memory_on(m) else []
                     recent=await self.recent_history(m,batch[0][0])
                     target=next((target for _,_,target in reversed(batch) if target is not None),None)
                     reference=None
@@ -324,13 +398,17 @@ class Whale(discord.Client):
                             reference['上一级引用']={'群友':clip(parent.author.display_name,32),
                                 '发言':clip(safe_text(parent.content),self.c['context_chars_per_message'])}
                     current='\n'.join(t for _,t,_ in batch)
+                    retrieval_query=current+' '+ ' '.join(r['text'] for r in (recent or [])[-2:])
+                    auto_memories=(retrieve_memory(self.store.db,m.guild.id,m.channel.id,
+                        m.author.id,retrieval_query,limit=3) if self.c['auto_memory_enabled'] and self.memory_on(m) else [])
                     explain=explanation_request(current)
                     excluded={x.id for x,_,_ in batch}
                     if reference is not None:
                         excluded.add(target.id)
                     messages=self.context.build(m.channel.id,excluded,m.author.display_name,
                         current,memories,m.author.id==int(self.c['owner_id']),recent=recent,
-                        reference=reference,explain=explain,continuation=kind=='continuation')
+                        reference=reference,explain=explain,continuation=kind=='continuation',
+                        auto_memories=auto_memories)
                     async with m.channel.typing():
                         result=await self.llm.chat(messages,kind,
                             max_tokens=self.c['explanation_max_output_tokens'] if explain else self.c['max_output_tokens'])
@@ -345,6 +423,12 @@ class Whale(discord.Client):
                         self.c['emoji_probability'])
                     reply=result+(' '+emote if emote else '')
                     sent=await self.send(m,reply,reference=kind!='casual')
+                    if self.c['auto_memory_enabled'] and self.memory_on(m):
+                        mark_engaged(self.store.db,[x.id for x,_,_ in batch])
+                        if getattr(sent,'id',None):
+                            record_memory(self.store.db,sent.id,m.guild.id,m.channel.id,
+                                self.user.id,'鲸鱼娘',reply,role='assistant',engaged=True,
+                                public=self.shareable(m.channel),subject=m.author.id)
                     if self.memory_on(m):
                         self.context.add(m.channel.id,getattr(sent,'id',0),self.user.id,'鲸鱼娘',reply,'assistant')
                     if kind!='casual':
@@ -369,6 +453,8 @@ class Whale(discord.Client):
             self.kinds.pop(key,None)
 
     async def on_raw_message_delete(self,payload):
+        if self.c['auto_memory_enabled']:
+            erase_message(self.store.db,payload.message_id)
         self.context.remove(payload.channel_id,payload.message_id)
         self.dialogue.remove_reply(payload.channel_id,payload.message_id)
         for key,batch in list(self.pending.items()):

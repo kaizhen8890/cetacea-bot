@@ -11,6 +11,7 @@ from setup_gui import parse_server_lines,format_server_lines
 from storage import Store,BudgetExceeded,day_key
 from engine import Context,Policy,ConversationTracker,LLM,APIError,prompt_bytes,explanation_request,choose_emote
 from bot import Whale
+from memory import save_summary
 
 def config():
     c=json.loads((ROOT/'config.example.json').read_text(encoding='utf-8-sig'))
@@ -315,6 +316,27 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
         args=self.bot.llm.chat.call_args[0][0]
         self.assertIn('今天吃什么',args[-1]['content'])
         self.assertFalse(m1.channel.send.call_args.kwargs['allowed_mentions'].everyone)
+
+    async def test_local_summary_is_recalled_without_cloud_summary_call(self):
+        self.bot.c['auto_memory_enabled']=True
+        first=message(101,'<@50> 电磁感应是什么')
+        first.guild.default_role=object()
+        first.channel.guild=first.guild
+        first.channel.permissions_for=lambda role:SimpleNamespace(view_channel=True)
+        first.channel.send.return_value=SimpleNamespace(id=102)
+        await self.bot.on_message(first)
+        await asyncio.gather(*self.bot.workers.values())
+        rows=[dict(r) for r in self.s.db.execute('SELECT * FROM journal ORDER BY created')]
+        self.assertEqual(len(rows),2)
+        save_summary(self.s.db,rows,{'body':'小明询问电磁感应原理',
+                                     'keywords':['电磁感应']})
+        second=message(103,'<@50> 电磁感应还有例子吗')
+        second.channel=first.channel
+        second.guild=first.guild
+        await self.bot.on_message(second)
+        await asyncio.gather(*self.bot.workers.values())
+        self.assertIn('相关旧事',str(self.bot.llm.chat.call_args.args[0]))
+        self.assertEqual(self.bot.llm.chat.await_count,2)
 
     async def test_multiple_guilds_and_channels_obey_whitelist(self):
         for guild_id,channel_id in ((1,2),(1,4),(5,6)):

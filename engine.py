@@ -62,7 +62,8 @@ class Context:
                                    maxlen=self.c['context_messages'])
 
     def build(self, channel, current_ids, name, text, memories, owner=False,
-              recent=None, reference=None, explain=False, continuation=False):
+              recent=None, reference=None, explain=False, continuation=False,
+              auto_memories=None):
         c = self.c
         now = time.monotonic()
         guidance = ('\n本次是解释或教学请求：认真回答问题，必要时分段说明，可以写长一些。'
@@ -81,8 +82,11 @@ class Context:
             body = row['text'] if row['role']=='assistant' else json.dumps(
                 {'群友':row['name'],'发言':row['text']}, ensure_ascii=False)
             messages.append({'role':row['role'],'content':body})
-        payload = {'群友':clip(name,32),'本频道中该群友主动保存的记忆':memories,
+        payload = {'群友':clip(name,32),'本服务器中该群友主动保存且当前可用的记忆':memories,
                    '当前发言':clip(safe_text(text),c['input_chars'])}
+        if auto_memories:
+            payload['相关旧事']=[{'来源':'亲自交谈' if x['kind']!='glance' else '旁观印象',
+                              '内容':clip(x['text'],200)} for x in auto_memories]
         if reference:
             payload['正在回复的消息'] = reference
         if continuation:
@@ -90,8 +94,11 @@ class Context:
         messages.append({'role':'user','content':json.dumps(payload,ensure_ascii=False)})
         while prompt_bytes(messages) > c['max_prompt_bytes'] and len(messages)>2:
             messages.pop(1)
+        if prompt_bytes(messages)>c['max_prompt_bytes'] and '相关旧事' in payload:
+            payload.pop('相关旧事')
+            messages[-1]['content']=json.dumps(payload,ensure_ascii=False)
         if prompt_bytes(messages)>c['max_prompt_bytes']:
-            payload['本频道中该群友主动保存的记忆'] = []
+            payload['本服务器中该群友主动保存且当前可用的记忆'] = []
             messages[-1]['content']=json.dumps(payload,ensure_ascii=False)
         if prompt_bytes(messages)>c['max_prompt_bytes']:
             raise APIError('人设或消息太长，请缩短后重试。')

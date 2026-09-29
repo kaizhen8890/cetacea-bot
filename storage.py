@@ -2,6 +2,7 @@
 import math
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from memory import install as install_memory
 
 LOCAL_ZONE = timezone(timedelta(hours=8))
 
@@ -27,6 +28,7 @@ class Store:
                 PRIMARY KEY(guild,channel,user,key));
             CREATE TABLE IF NOT EXISTS prefs (key TEXT PRIMARY KEY, value TEXT);
         ''')
+        install_memory(self.db)
 
     def close(self):
         self.db.close()
@@ -82,6 +84,11 @@ class Store:
         return [dict(r) for r in self.db.execute(
             'SELECT key,value FROM memories WHERE guild=? AND channel=? AND user=? ORDER BY key',
             (str(guild), str(channel), str(user)))]
+
+    def guild_memories(self,guild,user):
+        return [dict(r) for r in self.db.execute(
+            'SELECT channel,key,value FROM memories WHERE guild=? AND user=? ORDER BY key',
+            (str(guild),str(user)))]
 
     def remember(self, guild, channel, user, key, value, limit=12):
         key, value = key.strip(), value.strip()
