@@ -175,7 +175,8 @@ def main():
     descriptions={'random':'掷骰、抽签、帮忙选一个','calculator':'数学计算、常用单位换算',
                   'reminders':'提醒与倒计时','interaction':'摸摸、投喂与表情包',
                   'polls':'按钮投票与结果','rice':'每日签到、饭碗余额',
-                  'games':'猜数字、石头剪刀布','notes':'本人便签、关键词查群规','dates':'生日和纪念日提醒'}
+                  'games':'猜数字、石头剪刀布','notes':'本人便签、关键词查群规','dates':'生日和纪念日提醒',
+                  'wordle':'5/7 字母合作猜词、图片棋盘'}
     feature_grid=ttk.Frame(local_tab)
     feature_grid.pack(fill='x')
     for column in (0,1):

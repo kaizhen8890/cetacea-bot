@@ -8,6 +8,7 @@ from datetime import datetime,timedelta,timezone
 
 FEATURE_LABELS={'random':'随机工具','calculator':'计算换算','reminders':'提醒计时','interaction':'鲸鱼互动'}
 FEATURE_LABELS.update(polls='投票',rice='米饭签到',games='小游戏',notes='便签群规',dates='日期提醒')
+FEATURE_LABELS['wordle']='合作 Wordle'
 FEATURE_ALIASES={'随机':'random','随机工具':'random','掷骰':'random','抽签':'random','选择':'random',
                  '计算':'calculator','换算':'calculator','计算换算':'calculator',
                  '提醒':'reminders','计时':'reminders','提醒计时':'reminders',
@@ -15,6 +16,7 @@ FEATURE_ALIASES={'随机':'random','随机工具':'random','掷骰':'random','�
 FEATURE_ALIASES.update(投票='polls',签到='rice',米饭='rice',米饭签到='rice',
                        游戏='games',小游戏='games',便签='notes',群规='notes',便签群规='notes',
                        生日='dates',纪念日='dates',日期='dates',日期提醒='dates')
+FEATURE_ALIASES.update(Wordle='wordle',WORDLE='wordle',猜词='wordle',合作Wordle='wordle')
 
 
 def annual_date(text):

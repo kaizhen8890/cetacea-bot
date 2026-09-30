@@ -1,6 +1,7 @@
 """Discord slash commands and buttons for the local feature service."""
 import logging
 import discord
+from wordle_discord import add_commands as add_wordle_commands
 
 LOG=logging.getLogger('cetacea')
 
@@ -218,4 +219,5 @@ def command_group(bot):
     async def cancel_anniversary(interaction:discord.Interaction,名称:str):
         await bot.local_interaction(interaction,'取消纪念日 '+名称)
 
+    add_wordle_commands(group,bot)
     return group

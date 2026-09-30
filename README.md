@@ -12,6 +12,8 @@
 2. 安装 Python 3.11 或更新版本，并在安装时勾选 **Add Python to PATH**。项目在 Windows 的 Python 3.14 环境做过测试。
 3. 双击 `configure.cmd`。首次打开会自动建立 `.venv` 并安装 `requirements.txt` 中的依赖，可能需要几分钟。
 
+更新已有安装时，先在项目文件夹执行 `.venv\Scripts\python.exe -m pip install -r requirements.txt`，再保存并重启机器人。Wordle 图片棋盘新增了 Pillow 依赖。
+
 ### 2. 创建 Discord 机器人
 
 1. 打开 [Discord Developer Portal](https://discord.com/developers/applications)，创建一个 Application。
@@ -118,6 +120,30 @@
 
 使用 `/鲸鱼 投票` 时，分别填写「问题」「选项1」「选项2」；如需更多选项，再添加「选项3」至「选项8」。前两项必填，后六项可留空，不需要手动输入分隔符。问题和单个选项不能包含 `|` 或 `｜`。例如问题填“今晚吃什么”，选项1填“米饭”，选项2填“面条”。文字指令仍使用上表中的 `|` 分隔格式。
 
+## 合作 Wordle 图片棋盘
+
+普通模式猜 **5 字母**英文单词，全频道共享 **6 次**机会；超级模式猜 **7 字母**英文单词，全频道共享 **12 次**机会。每个已选文字频道同时只能有一局，所有群友都可参加，服务器和频道之间分别开局。普通聊天、讨论候选词不会自动提交猜测。
+
+| 操作 | 斜杠命令 | 文字命令 |
+| --- | --- | --- |
+| 开局 | `/鲸鱼 wordle 开始`，模式下拉选普通或超级 | `!鲸鱼 wordle 开始 超级` |
+| 猜词 | `/鲸鱼 wordle 猜`，填写单词 | `!鲸鱼 wordle 猜 cartoon` |
+| 查看或恢复棋盘 | `/鲸鱼 wordle 状态` | `!鲸鱼 wordle 状态` |
+| 提前结束 | `/鲸鱼 wordle 结束` | `!鲸鱼 wordle 结束` |
+| 查看规则 | `/鲸鱼 wordle 规则` | `!鲸鱼 wordle 帮助` |
+
+棋盘消息有「提交猜测」按钮，点击后弹出一个输入框；也可明确回复原棋盘消息并只填写一个五字母或七字母英文单词。🟩 代表字母与位置正确，🟨 代表字母存在但位置不同，⬛ 代表没有剩余的该字母可匹配。重复字母先计算绿格，再按答案中的剩余数量分配黄格。大小写不影响判定；长度错误、词库中没有的词、全频道已猜过的词都不扣次数。同一人两次有效猜测至少间隔三秒；多人同时提交会依次记入同一局。
+
+每次有效猜测后，在本机用 Pillow 绘制小 PNG，更新**同一条棋盘消息**的附图，显示每条猜测、提交者与字母键盘状态，不调用图片生成模型或聊天 API。频道需要允许机器人 **Attach Files**（发送附件）；缺少权限、绘图或图片上传失败时会改用文字棋盘，猜测仍保存。若原棋盘被删除，「状态」会重新发送棋盘；发送消息权限暂不可用时也会保留进度，恢复权限后再查询。
+
+猜中或机会用完后揭晓答案并关闭输入按钮。提前结束只允许发起人、服务器管理员或本机指定的主人；进行中的游戏不能被别人重新开局覆盖。重启后恢复进行中的棋盘按钮与次数，旧一局的按钮或已打开输入框不能消耗新一局的机会。默认不设短倒计时，结束的记录保留 30 天。
+
+Wordle 有独立开关，可在桌面配置的「本地功能」页调整，或用 `!鲸鱼 关闭功能 wordle` / `!鲸鱼 开启功能 wordle` 管理本服务器。关闭后不能开局或猜测，但仍可看状态、查看规则或由授权者结束。纯本地模式、聊天暂停或模型额度用完时仍可使用。猜词指令与棋盘不会进入自动聊天记忆或云端上下文。
+
+英文词库随源码附带，运行时不联网查词：允许猜测的词库较大，答案候选来自更常用的分级词表；五字母和七字母各自独立。词表基于 [English Speller Database / ESDB](https://github.com/en-wl/wordlist) 生成，来源、固定版本、筛选方式和版权说明见 `wordlists/README.md` 与 `wordlists/ESDB-Copyright.txt`；采用独立随机答案，不接入 NYT 每日题目。游戏不含在线词义查询、排行榜或收费提示。
+
+## 本地功能的保存与运行
+
 “摸摸鲸鱼娘”“给鲸鱼娘喂饭”等明确动作也能本地回应，同一人十五秒内不会连续触发。普通的“吃饭”“困了”等群聊词不会触发本地互动。工具指令和回复会从近期云端聊天上下文中排除；近期本地结果上的“再来一次”也在本地处理，不启动收费续聊。每人每十秒最多处理六次本地操作；按钮三分钟内可用，过期可重新发命令。投票按钮独立保存，重启后仍能使用，七天后结束。
 
 米饭、投票和群规始终按服务器隔离；便签和游戏另外按用户、频道隔离。签到按 UTC+8 零点换日。关闭“米饭签到”后，投喂不扣米饭，适合只想用简单互动的服务器。
@@ -143,10 +169,10 @@
 
 ## 开发与文件
 
-核心代码：`bot.py` 处理 Discord 消息，`engine.py` 处理上下文、触发策略和模型调用，`provider.py` 校验自定义接口并构建兼容请求，`memory.py` 保存与检索自动记忆，`memory_worker.py` 调用本地 Ollama 并安排提醒，`storage.py` 保存手动记忆与费用。`local_tools.py` 提供本地运算，`local_features.py` 处理功能指令，`feature_store.py` 保存功能数据，`local_discord.py` 提供斜杠命令与按钮。`setup_gui.py` 提供本机配置窗口，`settings.py` 校验配置。`config.example.json` 是可公开的模板；个人 `config.json` 和 `.env` 由配置窗口生成。
+核心代码：`bot.py` 处理 Discord 消息，`engine.py` 处理上下文、触发策略和模型调用，`provider.py` 校验自定义接口并构建兼容请求，`memory.py` 保存与检索自动记忆，`memory_worker.py` 调用本地 Ollama 并安排提醒，`storage.py` 保存手动记忆与费用。`local_tools.py` 提供本地运算，`local_features.py` 处理功能指令，`feature_store.py` 保存功能数据，`local_discord.py` 提供斜杠命令与按钮。`wordle.py` 保存合作游戏、判定字母并绘图，`wordle_discord.py` 管理棋盘消息和猜测弹窗。`setup_gui.py` 提供本机配置窗口，`settings.py` 校验配置。`config.example.json` 是可公开的模板；个人 `config.json` 和 `.env` 由配置窗口生成。
 
 ```powershell
-.venv\Scripts\python.exe -X utf8 -m unittest -q test_bot test_memory test_provider test_local
+.venv\Scripts\python.exe -X utf8 -m unittest -q test_bot test_memory test_provider test_local test_wordle
 .venv\Scripts\python.exe -X utf8 check.py
 # 下面这条会真实调用一次模型并计入当日预算：
 .venv\Scripts\python.exe -X utf8 check.py --live

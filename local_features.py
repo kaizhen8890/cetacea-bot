@@ -19,6 +19,7 @@ TOOL_HELP=('🐳 本地工具，不消耗大模型 token：\n'
            '`!鲸鱼 摸摸` · `!鲸鱼 投喂`\n'
            '`!鲸鱼 签到` · `!鲸鱼 饭碗`\n'
            '`!鲸鱼 猜数字` · `!鲸鱼 猜拳 石头`\n'
+           '`!鲸鱼 wordle 开始 超级` · `/鲸鱼 wordle` 合作猜词与图片棋盘\n'
            '`!鲸鱼 投票 今晚吃什么 | 米饭 | 面条`\n'
            '`!鲸鱼 投票结果 编号` · `!鲸鱼 结束投票 编号`\n'
            '`!鲸鱼 便签 保存 名称=内容` · `!鲸鱼 便签 名称`\n'
@@ -136,7 +137,7 @@ class LocalFeatures:
                     raise ValueError('更改开关需要服务器管理权限或主人身份。')
                 target=FEATURE_ALIASES.get(args,args)
                 if target not in FEATURE_LABELS:
-                    raise ValueError('可选功能：随机、计算、提醒、互动、投票、签到、游戏、便签、日期。')
+                    raise ValueError('可选功能：随机、计算、提醒、互动、投票、签到、游戏、便签、日期、wordle。')
                 if name=='开启功能' and not self.defaults[target]:
                     raise ValueError('此功能在电脑配置中已关闭，请先在桌面配置里开启。')
                 self.db.toggle(guild,target,name=='开启功能')

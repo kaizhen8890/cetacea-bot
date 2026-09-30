@@ -18,6 +18,7 @@ from memory import record as record_memory, mark_engaged, retrieve as retrieve_m
 from memory_worker import model_ready, resource_ready
 from local_features import LocalFeatures,LocalResult,TOOL_HELP,natural_command,poll_text
 from local_discord import LocalCommandTree,LocalActionView,LocalPollView,command_group
+from wordle_discord import WordleService,is_wordle
 
 LOG=logging.getLogger('cetacea')
 HELP=('🐳 我是 DeepSeek 鲸鱼娘。@我或回复我开始聊天；我会接上两分钟内的自然追问。平时也会偶尔插话、用群内表情。\n'
@@ -57,6 +58,7 @@ class Whale(discord.Client):
         self.reminder_task=None
         self.llm=None
         self.local=LocalFeatures(c,store)
+        self.wordle=WordleService(self)
         self.tree=LocalCommandTree(self)
         self.tree.add_command(command_group(self))
 
@@ -65,6 +67,7 @@ class Whale(discord.Client):
         self.llm=LLM(self.c,self.store,self.session) if self.c.get('chat_enabled',True) else None
         self.local.db.recover()
         self.local.db.prune()
+        self.wordle.restore()
         for row in self.local.db.open_polls():
             gid,cid=int(row['guild']),int(row['channel'])
             if cid in self.allowed_channels.get(gid,()):
@@ -398,6 +401,7 @@ class Whale(discord.Client):
                 await self.deliver_reminders()
                 if time.time()>=prune_at:
                     self.local.db.prune()
+                    self.wordle.db.prune()
                     prune_at=time.time()+3600
             except asyncio.CancelledError:
                 raise
@@ -412,6 +416,9 @@ class Whale(discord.Client):
             return False
         self.local.db.remember_input(m.id,m.guild.id,m.channel.id)
         cmd=text[len('!鲸鱼'):].strip()
+        if is_wordle(cmd):
+            await self.wordle.text(m,cmd)
+            return True
         public=self.shareable(m.channel) if cmd.startswith('群规 ') else False
         result=self.local.execute(m.guild.id,m.channel.id,m.author.id,cmd,admin=self.admin(m),public=public)
         if result is not None:
@@ -520,6 +527,15 @@ class Whale(discord.Client):
         if target is not None:
             direct=direct or target.author.id==self.user.id
         clean=re.sub(rf'<@!?{self.user.id}>','',text).strip() or '鲸鱼娘，在吗？'
+        if direct and is_wordle(clean):
+            await self.wordle.text(m,clean)
+            return
+        if m.reference and (not m.reference.channel_id or m.reference.channel_id==m.channel.id):
+            rid=self.wordle.db.board_round(m.reference.message_id,m.guild.id,m.channel.id)
+            if rid is not None:
+                command='wordle 猜 '+clean if re.fullmatch(r'[A-Za-z]{5}|[A-Za-z]{7}',clean) else 'wordle 帮助'
+                await self.wordle.text(m,command,expected=rid)
+                return
         if direct and self.local.split_command(clean) is not None:
             public=self.shareable(m.channel) if clean.startswith('群规 ') else False
             result=self.local.execute(m.guild.id,m.channel.id,m.author.id,clean,admin=self.admin(m),public=public)

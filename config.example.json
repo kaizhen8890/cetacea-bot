@@ -11,7 +11,8 @@
     "rice": true,
     "games": true,
     "notes": true,
-    "dates": true
+    "dates": true,
+    "wordle": true
   },
   "servers": [],
   "owner_id": 0,
