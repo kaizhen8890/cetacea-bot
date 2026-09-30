@@ -156,6 +156,31 @@ class ContextTests(unittest.TestCase):
         self.assertIn('正在回复的消息',msgs[-1]['content'])
         self.assertIn('教学',msgs[0]['content'])
 
+    def test_teaching_intent_covers_vocabulary_study_and_followups(self):
+        for text in ('有什么马来文字可以代替bertandang','可以用menziarahi代替吗',
+                     'bertandang的同义词','这个词的用法','两个词有何区别',
+                     '请指导我学习电磁感应','怎么计算磁通量','这题怎么做',
+                     '帮我检查这道题','帮我做这道题','帮我解答这道题','这个句子对吗','哪一步错了，请帮我分析',
+                     '我没听懂','能举个例子吗','详细一点','explain this term',
+                     'how do I solve this equation','what is induction'):
+            with self.subTest(text=text):
+                self.assertTrue(explanation_request(text))
+        for text in ('今天吃什么','鲸鱼好胖','哈哈','晚安','谢谢','我去','老师今天罚我背诵了'):
+            with self.subTest(text=text):
+                self.assertFalse(explanation_request(text))
+
+    def test_new_question_remains_the_active_request_after_quote_background(self):
+        reference={'群友':'鲸鱼娘','发言':'可以用那个词代替。',
+                   '上一级引用':{'群友':'小明','发言':'这个词可以代替吗'}}
+        msgs=Context(config()).build(2,set(),'小明','还有哪些同义词',[],
+            reference=reference,explain=True,longform=True)
+        payload=json.loads(msgs[-1]['content'])
+        self.assertEqual(next(reversed(payload)),'当前发言')
+        self.assertEqual(payload['当前发言'],'还有哪些同义词')
+        self.assertEqual(payload['正在回复的消息'],reference)
+        self.assertIn('当前发言决定',msgs[0]['content'])
+        self.assertIn('不要把被引用的旧问题再答一遍',msgs[0]['content'])
+
     def test_context_bound_and_current_message_not_duplicated(self):
         c=config()
         ctx=Context(c)

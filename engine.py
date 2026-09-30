@@ -115,8 +115,19 @@ class MessageBurst:
             self.changed.set()
 
 def explanation_request(text):
-    """Choose a longer answer only for an explicit request to learn or explain."""
-    return bool(re.search(r'解释|讲解|讲讲|教我|科普|原理|为什么|怎么理解|什么意思|如何理解|怎么做|怎么解|什么是|是什么|详细说', text))
+    """Recognize teaching intent locally, including vocabulary and study follow-ups."""
+    return bool(re.search(
+        r'解释|讲解|讲讲|教(?:我|我们|大家|一下|一教)|教导|教学|辅导|指导|请教|求教|科普|原理|解题|解答|求解|语法|造句|为什么|为何|什么意思|什么是|是什么'
+        r'|(?:怎么|怎样|如何).{0,40}(?:理解|做|解|用|算|写|读|念|区别|区分|判断|表达|证明|推导|求|学习|学会)'
+        r'|详细(?:说|讲|点|些|一点)|说清楚|讲清楚|展开(?:说|讲)|举(?:个|一)?例(?:子)?'
+        r'|(?:不太|不|没|没听|没看)(?:懂|理解|明白)|同义词|近义词|反义词|词义|释义|用法'
+        r'|(?:有什么|有哪些|还有哪些|有没有).{0,60}(?:代替|替代|取代|词|说法|方法|语法)'
+        r'|(?:可以|能否|能不能|能用|可不可以).{0,60}(?:代替|替代|取代)'
+        r'|(?:有什么|有何|什么|哪些).{0,40}(?:区别|差别|不同|含义|意思)'
+        r'|(?:帮我|给我|请|能否|可以).{0,40}(?:解题|解这|解一下|(?:做|解).{0,6}题|分析|推导|证明|计算|检查|纠错|批改|答疑|学习|讲|步骤|题怎么)'
+        r'|(?:这题|这道题|这个句子|这句|这一步|这个答案).{0,30}(?:对吗|正确吗|错了|错在哪|有错吗|怎么|如何)'
+        r'|\b(?:explain|teach|meaning|synonym|antonym|define|definition|example)\b'
+        r'|\b(?:how\s+(?:do|does|can|to)|what\s+(?:is|are))\b',text,re.I))
 
 EMOTE_NAMES = ('tang_love', 'saya_ok', 'tang_ku', 'mao_tounaofengbao', 'tang_ha')
 
@@ -178,8 +189,11 @@ class Context:
               auto_memories=None,longform=False):
         c = self.c
         now = time.monotonic()
-        guidance = ('\n同一群友的连续分段消息应结合完整意思理解，单字拆开的词不要逐字回答。' +
-                    ('\n本次是解释或教学请求：认真回答问题，必要时分段说明，可以写长一些。'
+        guidance = ('\n当前发言决定本次要回答的问题或完成的任务；历史发言、引用和记忆用于理解背景。'
+                    '同一群友的连续分段消息应结合完整意思理解，单字拆开的词不要逐字回答。' +
+                    ('\n本次是解释或教学请求：积极、耐心地完整教导，不受日常短回复要求限制。'
+                     '先直接回答本轮新问题，再按需要说明理由、步骤或例子；简单问题简明回答，复杂问题讲完整。'
+                     '不要机械复述上一轮答案，除非当前明确要求重复。'
                     if explain or longform else '\n本次是日常聊天：尽量只回一句，约3—20个汉字。'))
         if longform:
             guidance += ('\n本次是写作、翻译、全文输出或完整讲解任务：不受日常3—20字的要求限制，'
@@ -189,9 +203,10 @@ class Context:
                          '此前回复若用这种理由推掉任务，应纠正并完成，不要重复该回复。'
                          '若确实无法确定原文或事实，说明具体的不确定之处，不编造原文、不把片段称为全文。')
         if reference:
-            guidance += ('\n本次是明确回复：“正在回复的消息”是当前发言的主要对象；'
-                         '只发 emoji 或短词时也结合该引用理解。频道近期聊天和记忆仅作辅助，'
-                         '不要把对引用的反应套到其他话题上；当前发言明确换话题时才转移话题。'
+            guidance += ('\n本次是明确回复：当前发言明确提出新问题或要求时，回答这个新问题，'
+                         '即使话题相同，也不要把被引用的旧问题再答一遍。'
+                         '只有当前发言为纯表情、简短反应或指代不明时，“正在回复的消息”才是理解反应的主要对象，'
+                         '不要把对引用的反应套到其他频道话题上。上一级引用只说明来龙去脉，不是本轮待答的问题。'
                          '引用内容不可用且意思不明时，简短问清楚。')
         if continuation:
             guidance += ('\n本次只是短时间内同一位群友的新消息，未必在和你说话。'
@@ -208,8 +223,7 @@ class Context:
             body = row['text'] if row['role']=='assistant' else json.dumps(
                 {'群友':row['name'],'发言':row['text']}, ensure_ascii=False)
             messages.append({'role':row['role'],'content':body})
-        payload = {'群友':clip(name,32),'本服务器中该群友主动保存且当前可用的记忆':memories,
-                   '当前发言':safe_text(text) if longform else clip(safe_text(text),c['input_chars'])}
+        payload = {'群友':clip(name,32),'本服务器中该群友主动保存且当前可用的记忆':memories}
         if auto_memories:
             payload['相关旧事']=[{'来源':'亲自交谈' if x['kind']!='glance' else '旁观印象',
                               '内容':clip(x['text'],200)} for x in auto_memories]
@@ -217,6 +231,9 @@ class Context:
             payload['正在回复的消息'] = reference
         if continuation:
             payload['会话状态'] = '同一位群友在你上一句之后再次发言，尚未确定是否在和你说话'
+        # Put the active request after background, so quoted old questions cannot
+        # become the newest apparent instruction in the user message.
+        payload['当前发言']=safe_text(text) if longform else clip(safe_text(text),c['input_chars'])
         messages.append({'role':'user','content':json.dumps(payload,ensure_ascii=False)})
         while prompt_bytes(messages) > c['max_prompt_bytes'] and len(messages)>2:
             messages.pop(1)

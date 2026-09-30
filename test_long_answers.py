@@ -166,6 +166,24 @@ class LongFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('孔雀东南飞全文',str(messages))
         self.assertIsNotNone(self.task())
 
+    async def test_vocabulary_question_and_teaching_followup_use_long_mode(self):
+        original=self.make(8,'可以用menziarahi代替吗')
+        old=self.make(9,'可以换，但探亲回门用 bertandang 更自然。',uid=50,bot=True,reference=8)
+        self.history.extend((original,old))
+        await self.handle(self.make(10,'有什么马来文字可以代替bertandang',reference=9))
+        messages=self.bot.llm.chat.call_args.args[0]
+        payload=json.loads(messages[-1]['content'])
+        self.assertEqual(payload['当前发言'],'有什么马来文字可以代替bertandang')
+        self.assertEqual(next(reversed(payload)),'当前发言')
+        self.assertEqual(payload['正在回复的消息']['上一级引用']['发言'],original.content)
+        self.assertNotIn('本次是日常聊天',messages[0]['content'])
+        self.assertEqual(self.bot.llm.chat.call_args.kwargs['max_tokens'],2048)
+        self.assertIsNotNone(self.task())
+        await self.handle(self.make(11,'能举个例子吗'))
+        self.assertEqual(self.bot.llm.chat.await_count,2)
+        self.assertEqual(self.bot.llm.chat.call_args.kwargs['max_tokens'],2048)
+        self.assertIn('举个例子',self.bot.llm.chat.call_args.args[0][-1]['content'])
+
     async def test_truncated_writing_automatically_continues_once_and_manual_resume_inherits_topic(self):
         self.bot.llm.chat.side_effect=[ModelReply('第一段正文。',True),ModelReply('第二段正文。',True),ModelReply('最后的结论。')]
         await self.handle(self.make(10,'<@50> 写一篇作文，主题是考试'))
