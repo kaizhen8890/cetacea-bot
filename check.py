@@ -20,13 +20,17 @@ async def check(live=False):
     store=Store(ROOT/'data/whale.sqlite3')
     try:
         async with aiohttp.ClientSession() as session:
-            try:
-                models=await asyncio.to_thread(fetch_model_ids,c['api_base'],c['api_key'])
-                print('模型列表验证：'+('通过' if c['model'] in models else
-                      '列表中未找到；仍可使用手动填写的模型名称'))
-            except ValueError as exc:
-                print(str(exc))
-            if live:
+            enabled=c.get('chat_enabled',True)
+            if enabled:
+                try:
+                    models=await asyncio.to_thread(fetch_model_ids,c['api_base'],c['api_key'])
+                    print('模型列表验证：'+('通过' if c['model'] in models else
+                          '列表中未找到；仍可使用手动填写的模型名称'))
+                except ValueError as exc:
+                    print(str(exc))
+            else:
+                print('纯本地模式：不连接模型接口，也不发送计费测试。')
+            if live and enabled:
                 text=await LLM(c,store,session).chat([
                     {'role':'system','content':c['persona']},
                     {'role':'user','content':'这是机器人接入测试，请用一句中文打招呼。'}],'test')

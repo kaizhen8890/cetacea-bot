@@ -3,6 +3,7 @@ import math
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from memory import install as install_memory
+from feature_store import install as install_features
 
 LOCAL_ZONE = timezone(timedelta(hours=8))
 
@@ -29,6 +30,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS prefs (key TEXT PRIMARY KEY, value TEXT);
         ''')
         install_memory(self.db)
+        install_features(self.db)
 
     def close(self):
         self.db.close()

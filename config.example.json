@@ -1,6 +1,18 @@
 {
   "api_base": "https://api.inferera.com/v1",
   "model": "deepseek-v4.1-flash",
+  "chat_enabled": true,
+  "local_features": {
+    "random": true,
+    "calculator": true,
+    "reminders": true,
+    "interaction": true,
+    "polls": true,
+    "rice": true,
+    "games": true,
+    "notes": true,
+    "dates": true
+  },
   "servers": [],
   "owner_id": 0,
   "daily_budget_rmb": 2.0,

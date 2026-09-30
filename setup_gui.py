@@ -16,6 +16,7 @@ from dotenv import dotenv_values,set_key
 from settings import ROOT, configured_servers
 from provider import (provider_settings,normalize_api_base,local_api,
                       default_extra_body,fetch_model_ids)
+from local_tools import configured_features,FEATURE_LABELS
 
 
 def provider_form_settings(config,values,extra_text):
@@ -38,8 +39,9 @@ def provider_form_settings(config,values,extra_text):
     if not math.isfinite(c['daily_budget_rmb']) or c['daily_budget_rmb']<=0:
         raise ValueError('每日预算必须是大于 0 的人民币金额。')
     api=values['api_key'].strip()
-    if any(x in api for x in '\r\n') or (not api and not local_api(c['api_base'])):
+    if any(x in api for x in '\r\n') or (c.get('chat_enabled',True) and not api and not local_api(c['api_base'])):
         raise ValueError('请填写单行模型 API 密钥；本机接口可以留空。')
+    c['local_features']=configured_features(c)
     c.pop('input_usd_per_million',None)
     c.pop('output_usd_per_million',None)
     c.pop('api_key',None)
@@ -105,21 +107,25 @@ def main():
     c=provider_settings(json.loads((config_path if config_path.exists() else template_path).read_text(encoding='utf-8-sig')))
     secrets=dotenv_values(ROOT/'.env')
     root=tk.Tk()
-    root.title('鲸鱼娘 · 本机配置')
+    root.title('鲸鱼娘 · 功能与模型设置')
     root.geometry('840x690')
     root.minsize(790,650)
     frame=ttk.Frame(root,padding=22)
     frame.pack(fill='both',expand=True)
     ttk.Label(frame,text='🐳 DeepSeek 鲸鱼娘',font=('Microsoft YaHei UI',19,'bold')).pack(anchor='w')
-    ttk.Label(frame,text='选择自己的模型接口，密钥仅保存在本机。保存并重启后生效。').pack(anchor='w',pady=(8,14))
+    ttk.Label(frame,text='设置模型、本地功能和频道。密钥仅保存在本机，保存并重启后生效。').pack(anchor='w',pady=(8,14))
+    footer=ttk.Frame(frame)
+    footer.pack(side='bottom',fill='x')
     notebook=ttk.Notebook(frame)
     notebook.pack(fill='both',expand=True)
     api_tab=ttk.Frame(notebook,padding=16)
     discord_tab=ttk.Frame(notebook,padding=16)
     advanced_tab=ttk.Frame(notebook,padding=16)
-    for tab,label in ((api_tab,'模型与预算'),(discord_tab,'Discord 频道'),(advanced_tab,'附加参数')):
+    local_tab=ttk.Frame(notebook,padding=16)
+    for tab,label in ((api_tab,'模型与预算'),(local_tab,'本地功能'),(discord_tab,'Discord 频道'),(advanced_tab,'附加参数')):
         notebook.add(tab,text=label)
     fields={}
+    widgets={}
     def entry(form,row,key,label,value,secret=False,choices=None):
         form.columnconfigure(1,weight=1)
         ttk.Label(form,text=label).grid(row=row,column=0,sticky='w',pady=7,padx=(0,12))
@@ -128,6 +134,7 @@ def main():
                 else ttk.Entry(form,textvariable=var,show='●' if secret else ''))
         widget.grid(row=row,column=1,sticky='ew')
         fields[key]=var
+        widgets[key]=widget
         return widget
     api_form=ttk.Frame(api_tab)
     api_form.pack(fill='x')
@@ -156,6 +163,43 @@ def main():
     ttk.Label(api_tab,text='价格请按供应商当前单价填写；免费接口填 0。预算由全部服务器共用，\n'
                           '仍保留费用余量和每日调用次数限制。本机估算不等于供应商账单。',
               foreground='#555555',wraplength=710).pack(anchor='w',pady=(10,0))
+    chat_enabled=tk.BooleanVar(value=c.get('chat_enabled',True))
+    ttk.Checkbutton(local_tab,text='开启云端聊天（被 @、自然续聊和偶尔插嘴会调用模型）',
+                    variable=chat_enabled).pack(anchor='w',pady=(0,8))
+    ttk.Label(local_tab,text='取消勾选即为纯本地模式：无需大模型密钥，以下功能仍可使用。\n'
+              'Discord Bot Token 仍用于连接服务器；本地记忆整理使用独立的 Ollama 设置。',
+              foreground='#555555',wraplength=710).pack(anchor='w',pady=(0,14))
+    ttk.Separator(local_tab).pack(fill='x',pady=(0,14))
+    feature_checks={}
+    defaults=configured_features(c)
+    descriptions={'random':'掷骰、抽签、帮忙选一个','calculator':'数学计算、常用单位换算',
+                  'reminders':'提醒与倒计时','interaction':'摸摸、投喂与表情包',
+                  'polls':'按钮投票与结果','rice':'每日签到、饭碗余额',
+                  'games':'猜数字、石头剪刀布','notes':'本人便签、关键词查群规','dates':'生日和纪念日提醒'}
+    feature_grid=ttk.Frame(local_tab)
+    feature_grid.pack(fill='x')
+    for column in (0,1):
+        feature_grid.columnconfigure(column,weight=1)
+    for index,(name,label) in enumerate(FEATURE_LABELS.items()):
+        var=tk.BooleanVar(value=defaults[name])
+        feature_checks[name]=var
+        ttk.Checkbutton(feature_grid,text=label+'\n'+descriptions[name],variable=var).grid(
+            row=index//2,column=index%2,sticky='w',pady=3,padx=(0,12))
+    ttk.Label(local_tab,text='各服务器管理员可用 !鲸鱼 开启功能 提醒 / 关闭功能 提醒 调整。\n'
+              '本地工具不占聊天 token，暂停聊天后仍可用。\n'
+              '自备图片：data/reactions/feed.gif（投喂）、pat.png（摸摸）。\n'
+              '支持 GIF、PNG、JPG、WEBP，每张最多 4MB；没有图片时用文字和群内表情。',
+              wraplength=710,foreground='#555555').pack(anchor='w',pady=10)
+    def mode_changed(*args):
+        enabled=chat_enabled.get()
+        for name in ('api_base','api_key','model','pricing_currency','input_price_per_million',
+                     'output_price_per_million','daily_budget_rmb'):
+            state='readonly' if name=='pricing_currency' else 'normal'
+            widgets[name].configure(state=state if enabled else 'disabled')
+        exchange_entry.configure(state='normal' if enabled and fields['pricing_currency'].get()=='美元 (USD)' else 'disabled')
+        model_button.configure(state='normal' if enabled else 'disabled')
+    chat_enabled.trace_add('write',mode_changed)
+    mode_changed()
     discord_form=ttk.Frame(discord_tab)
     discord_form.pack(fill='x')
     entry(discord_form,0,'discord_token','Bot Token（非 Public Key）',secrets.get('DISCORD_TOKEN',''),True)
@@ -190,7 +234,7 @@ def main():
         previous_base['value']=base
     fields['api_base'].trace_add('write',base_changed)
     status=tk.StringVar(value='可自由填写接口地址与模型；读取模型列表不是必需步骤。')
-    ttk.Label(frame,textvariable=status,wraplength=750).pack(anchor='w',pady=(12,8))
+    ttk.Label(footer,textvariable=status,wraplength=750).pack(anchor='w',pady=(12,8))
     completions=queue.Queue()
     def run_background(action,done):
         def worker():
@@ -221,7 +265,7 @@ def main():
         model_button.configure(state='disabled')
         status.set('正在读取模型列表；不会发送聊天请求。')
         def done(models,error):
-            model_button.configure(state='normal')
+            model_button.configure(state='normal' if chat_enabled.get() else 'disabled')
             if fields['api_base'].get().strip().rstrip('/') not in (base,base+'/chat/completions'):
                 status.set('接口地址已改变，请重新读取列表。')
                 return
@@ -310,7 +354,9 @@ def main():
             api=fields['api_key'].get().strip()
             if not token or any('\n' in x or '\r' in x for x in (token,api)):
                 raise ValueError('请填写单行 Bot Token 和模型密钥。')
-            next_config=provider_form_settings(c,{k:v.get() for k,v in fields.items()},
+            form_config=dict(c,chat_enabled=chat_enabled.get(),
+                             local_features={k:v.get() for k,v in feature_checks.items()})
+            next_config=provider_form_settings(form_config,{k:v.get() for k,v in fields.items()},
                                                extra_box.get('1.0','end'))
             servers=parse_server_lines(servers_box.get('1.0','end'))
             if not servers:
@@ -371,7 +417,7 @@ def main():
                webbrowser.open('https://discord.com/developers/applications')).pack(side='left',padx=8)
     ttk.Label(discord_tab,text='首次使用：在开发者后台创建 Bot，开启 Message Content Intent，\n'
               '将机器人安装到服务器，再粘贴 Token 并选择频道。',wraplength=710).pack(anchor='w')
-    buttons=ttk.Frame(frame)
+    buttons=ttk.Frame(footer)
     buttons.pack(fill='x',pady=(3,0))
     ttk.Button(buttons,text='保存配置',command=save).pack(side='left',padx=(0,10))
     start_button=ttk.Button(buttons,text='保存并重启机器人',command=start)

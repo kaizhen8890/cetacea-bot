@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 from provider import provider_settings,local_api
+from local_tools import configured_features
 
 ROOT = Path(__file__).resolve().parent
 
@@ -39,6 +40,10 @@ def configured_servers(c):
 def load_settings(require_discord=False):
     load_dotenv(ROOT / '.env')
     c = provider_settings(json.loads((ROOT / 'config.json').read_text(encoding='utf-8-sig')))
+    c.setdefault('chat_enabled',True)
+    if type(c['chat_enabled']) is not bool:
+        raise ValueError('聊天开关必须是 true 或 false')
+    c['local_features']=configured_features(c)
     c.setdefault('auto_memory_enabled',False)
     c.setdefault('local_memory_model','qwen3.5:2b-q4_K_M')
     c.setdefault('auto_memory_prompt',True)
@@ -68,7 +73,7 @@ def load_settings(require_discord=False):
     c['servers'] = configured_servers(c)
     c.pop('guild_id',None)
     c.pop('channel_ids',None)
-    if not c['api_key'] and not local_api(c['api_base']):
+    if c['chat_enabled'] and not c['api_key'] and not local_api(c['api_base']):
         raise ValueError('请先填写模型 API 密钥')
     if any('\n' in v or '\r' in v for v in (c['api_key'],c['discord_token'])):
         raise ValueError('密钥和 Discord Token 必须为单行文本')

@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import hashlib
 import logging
 import logging.handlers
 import re
@@ -15,11 +16,14 @@ from storage import Store, BudgetExceeded
 from engine import Context, Policy, ConversationTracker, LLM, APIError, MessageChanged, MessageBurst, join_fragments, compact_history, clip, safe_text, explanation_request, choose_emote, EMOTE_NAMES
 from memory import record as record_memory, mark_engaged, retrieve as retrieve_memory, erase_message, erase_user, status as memory_status, next_batch, pending_fold
 from memory_worker import model_ready, resource_ready
+from local_features import LocalFeatures,LocalResult,TOOL_HELP,natural_command,poll_text
+from local_discord import LocalCommandTree,LocalActionView,LocalPollView,command_group
 
 LOG=logging.getLogger('cetacea')
 HELP=('🐳 我是 DeepSeek 鲸鱼娘。@我或回复我开始聊天；我会接上两分钟内的自然追问。平时也会偶尔插话、用群内表情。\n'
       '本地命令（不调用模型）：\n'
       '`!鲸鱼 状态` · `!鲸鱼 帮助`\n'
+      '`!鲸鱼 工具` 查看掷骰、选择、计算、换算、提醒和鲸鱼互动；也可用 `/鲸鱼`。\n'
       '`!鲸鱼 记住 称呼=小明`（同名覆盖，可用于纠正）\n'
       '`!鲸鱼 记忆` · `!鲸鱼 记忆状态` · `!鲸鱼 忘记 称呼` · `!鲸鱼 清空记忆`\n'
       '`!鲸鱼 关闭记忆` · `!鲸鱼 开启记忆`\n'
@@ -45,18 +49,43 @@ class Whale(discord.Client):
         self.workers={}
         self.kinds={}
         self.channel_locks=defaultdict(asyncio.Lock)
+        self.poll_locks=defaultdict(asyncio.Lock)
         self.last_notice={}
         self.available_emotes={}
         self.session=None
         self.memory_task=None
+        self.reminder_task=None
+        self.llm=None
+        self.local=LocalFeatures(c,store)
+        self.tree=LocalCommandTree(self)
+        self.tree.add_command(command_group(self))
 
     async def setup_hook(self):
         self.session=aiohttp.ClientSession()
-        self.llm=LLM(self.c,self.store,self.session)
+        self.llm=LLM(self.c,self.store,self.session) if self.c.get('chat_enabled',True) else None
+        self.local.db.recover()
+        self.local.db.prune()
+        for row in self.local.db.open_polls():
+            gid,cid=int(row['guild']),int(row['channel'])
+            if cid in self.allowed_channels.get(gid,()):
+                poll=self.local.db.poll(row['id'],gid,cid)
+                self.add_view(LocalPollView(self,poll),message_id=int(row['message']))
+        self.reminder_task=asyncio.create_task(self.reminder_scheduler())
+        for gid in self.allowed_channels:
+            guild=discord.Object(id=gid)
+            self.tree.copy_global_to(guild=guild)
+            try:
+                await self.tree.sync(guild=guild)
+                LOG.info('服务器 %s 的 /鲸鱼 本地命令已同步',gid)
+            except discord.HTTPException as exc:
+                LOG.warning('服务器 %s 斜杠命令暂未同步：%s；文字指令仍可用',gid,type(exc).__name__)
         if self.c['auto_memory_enabled']:
             self.memory_task=asyncio.create_task(self.memory_scheduler())
 
     async def close(self):
+        if self.reminder_task:
+            self.reminder_task.cancel()
+            await asyncio.gather(self.reminder_task,return_exceptions=True)
         if self.memory_task:
             self.memory_task.cancel()
             await asyncio.gather(self.memory_task,return_exceptions=True)
@@ -71,6 +100,7 @@ class Whale(discord.Client):
     async def on_ready(self):
         LOG.info('鲸鱼娘已上线：%s；允许服务器数：%s；允许频道数：%s',self.user,
                  len(self.allowed_channels),sum(len(ids) for ids in self.allowed_channels.values()))
+        LOG.info('聊天模式：%s；本地工具已就绪','云端聊天开启' if self.c.get('chat_enabled',True) else '纯本地')
         self.available_emotes={}
         for gid,channel_ids in self.allowed_channels.items():
             guild=self.get_guild(gid)
@@ -169,6 +199,10 @@ class Whale(discord.Client):
             return False
         if old.content.strip().startswith('!鲸鱼'):
             return False
+        if self.local.db.reply_command(old.id,m.guild.id,m.channel.id) is not None:
+            return False
+        if self.local.db.is_input(old.id,m.guild.id,m.channel.id):
+            return False
         if not old.author.bot and (self.store.pref(
                 f'memory_off:{m.guild.id}:{old.author.id}')=='1' or self.store.pref(
                 f'memory_off:{m.guild.id}:{m.channel.id}:{old.author.id}')=='1'):
@@ -226,20 +260,174 @@ class Whale(discord.Client):
         if now-self.last_notice.get(key,float('-inf'))<interval:
             return
         self.last_notice[key]=now
-        await self.send(m,text)
+        return await self.send(m,text)
+
+    def reaction_file(self,asset):
+        if asset not in ('feed','pat'):
+            return None
+        for suffix in ('.gif','.png','.jpg','.jpeg','.webp'):
+            path=ROOT/'data/reactions'/(asset+suffix)
+            try:
+                if path.is_file() and path.stat().st_size<=4*1024*1024:
+                    return discord.File(path)
+            except OSError:
+                LOG.warning('本地互动图片暂时无法读取；使用文字和群内表情')
+        return None
+
+    def local_presentation(self,result,guild,channel):
+        text=result.text
+        if result.category=='interaction' and text:
+            emote=choose_emote(text,self.available_emotes.get(guild,{}),self.c['emoji_probability'])
+            if emote:
+                text+=' '+emote
+        kwargs={'allowed_mentions':discord.AllowedMentions.none()}
+        if result.poll:
+            kwargs['view']=LocalPollView(self,self.local.db.poll(result.poll,guild,channel))
+        elif result.buttons:
+            kwargs['view']=LocalActionView(self,result.buttons,guild,channel)
+        file=self.reaction_file(result.asset)
+        if file:
+            kwargs['file']=file
+        return clip(text,1850),kwargs,file
+
+    async def send_local(self,m,result):
+        self.local.db.remember_input(m.id,m.guild.id,m.channel.id)
+        if not result.text:
+            return
+        text,kwargs,file=self.local_presentation(result,m.guild.id,m.channel.id)
+        try:
+            sent=await m.channel.send(text,reference=m.to_reference(fail_if_not_exists=False),**kwargs)
+            self.local.db.remember_reply(getattr(sent,'id',None),m.guild.id,m.channel.id,result.command)
+            if result.poll:
+                self.local.db.poll_message(result.poll,getattr(sent,'id',None))
+                await self.update_closed_poll(result.poll,m.channel)
+        finally:
+            if file:
+                file.close()
+
+    async def local_interaction(self,interaction,command):
+        guild,channel=interaction.guild_id,interaction.channel_id
+        if (guild is None or channel not in self.allowed_channels.get(guild,()) or
+                not isinstance(interaction.channel,discord.TextChannel)):
+            await interaction.response.send_message('此频道尚未启用鲸鱼娘，请在已选文字频道使用。',ephemeral=True)
+            return
+        user=interaction.user
+        is_admin=user.id==int(self.c['owner_id']) or user.guild_permissions.manage_guild
+        public=self.shareable(interaction.channel) if command.startswith('群规 ') else False
+        result=self.local.execute(guild,channel,user.id,command,admin=is_admin,public=public)
+        if result is None:
+            result=LocalResult('不认识这个本地指令，请用 /鲸鱼 工具 查看用法。',private=True)
+        if not result.text:
+            result=LocalResult('等十秒再来玩嘛。',private=True)
+        text,kwargs,file=self.local_presentation(result,guild,channel)
+        try:
+            if file:
+                await interaction.response.defer(thinking=True,ephemeral=result.private)
+                sent=await interaction.followup.send(text,ephemeral=result.private,wait=True,**kwargs)
+            else:
+                await interaction.response.send_message(text,ephemeral=result.private,**kwargs)
+                sent=await interaction.original_response()
+            if not result.private:
+                self.local.db.remember_reply(getattr(sent,'id',None),guild,channel,result.command)
+            if result.poll:
+                self.local.db.poll_message(result.poll,getattr(sent,'id',None))
+                await self.update_closed_poll(result.poll,interaction.channel)
+        finally:
+            if file:
+                file.close()
+
+    async def update_closed_poll(self,pid,channel):
+        poll=self.local.db.poll(pid,channel.guild.id,channel.id)
+        if poll['status']=='closed' and poll['message']:
+            try:
+                await channel.get_partial_message(int(poll['message'])).edit(content=poll_text(poll),
+                    view=LocalPollView(self,poll),allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException:
+                LOG.warning('投票 #%s 已结束，原消息暂时无法更新',pid)
+
+    async def local_vote(self,interaction,pid,choice):
+        gid,cid=interaction.guild_id,interaction.channel_id
+        if (gid is None or cid not in self.allowed_channels.get(gid,()) or
+                not isinstance(interaction.channel,discord.TextChannel) or not self.local.enabled(gid,'polls')):
+            await interaction.response.send_message('本频道的投票功能未开启。',ephemeral=True)
+            return
+        # Acknowledge first; serialization also prevents older edits hiding newer votes.
+        await interaction.response.defer()
+        async with self.poll_locks[pid]:
+            try:
+                poll=self.local.db.poll(pid,gid,cid)
+                if str(interaction.message.id)!=poll['message']:
+                    raise ValueError('请在原投票消息上操作。')
+                poll=self.local.db.vote(pid,gid,cid,interaction.user.id,choice)
+                await interaction.message.edit(content=poll_text(poll),view=LocalPollView(self,poll),
+                                               allowed_mentions=discord.AllowedMentions.none())
+            except ValueError as exc:
+                await interaction.followup.send(str(exc),ephemeral=True)
+
+    async def deliver_reminders(self,now=None):
+        now=time.time() if now is None else now
+        scopes=[(gid,cid,self.local.enabled(gid,'reminders'),self.local.enabled(gid,'dates'))
+                for gid,ids in self.allowed_channels.items()
+                if self.local.enabled(gid,'reminders') or self.local.enabled(gid,'dates') for cid in ids]
+        for row in self.local.db.due(now,scopes):
+            if not self.local.db.claim(row['id']):
+                continue
+            try:
+                channel=self.get_channel(int(row['channel']))
+                if not isinstance(channel,discord.TextChannel) or channel.guild.id!=int(row['guild']):
+                    raise ValueError('原频道暂不可用')
+                late='（已到期，补发提醒）' if now-row['due']>30 else ''
+                text=f'<@{row["user"]}> 🐳 提醒 #{row["id"]}{late}：{safe_text(row["body"])}'
+                nonce=hashlib.sha256(f'{row["id"]}:{row["due"]}'.encode()).hexdigest()[:20]
+                sent=await asyncio.wait_for(channel.send(text,nonce=nonce,
+                    allowed_mentions=discord.AllowedMentions(everyone=False,roles=False,
+                        users=[discord.Object(id=int(row['user']))],replied_user=False)),timeout=20)
+                self.local.db.finish(row['id'],getattr(sent,'id',None),now)
+                self.local.db.remember_reply(getattr(sent,'id',None),row['guild'],row['channel'],'提醒列表')
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.local.db.retry(row['id'],now)
+                LOG.warning('提醒 #%s 暂未发送：%s',row['id'],type(exc).__name__)
+
+    async def reminder_scheduler(self):
+        await self.wait_until_ready()
+        prune_at=time.time()+3600
+        while not self.is_closed():
+            try:
+                await self.deliver_reminders()
+                if time.time()>=prune_at:
+                    self.local.db.prune()
+                    prune_at=time.time()+3600
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOG.warning('提醒调度暂时失败：%s',type(exc).__name__)
+            await asyncio.sleep(5)
 
     async def command(self,m,text):
+        if self.user:
+            text=re.sub(rf'<@!?{self.user.id}>','',text).strip()
         if not text.startswith('!鲸鱼'):
             return False
-        self.dialogue.clear(m.channel.id)
+        self.local.db.remember_input(m.id,m.guild.id,m.channel.id)
         cmd=text[len('!鲸鱼'):].strip()
+        public=self.shareable(m.channel) if cmd.startswith('群规 ') else False
+        result=self.local.execute(m.guild.id,m.channel.id,m.author.id,cmd,admin=self.admin(m),public=public)
+        if result is not None:
+            await self.send_local(m,result)
+            return True
+        self.dialogue.clear(m.channel.id)
         scope=(m.guild.id,m.channel.id,m.author.id)
         if cmd in ('','帮助'):
             reply=HELP
+            if not self.c.get('chat_enabled',True):
+                reply='🐳 当前是纯本地模式，云端聊天已关闭。\n'+TOOL_HELP
         elif cmd=='状态':
             u=self.store.usage()
             paused=self.store.pref(f'paused:{m.channel.id}')=='1'
             reply=(f'🐳 {"暂停聊天" if paused else "正在听群友聊天"}。\n'
+                   f'聊天模型：{"启用" if self.c.get("chat_enabled",True) else "关闭（纯本地模式）"}；本地工具不占 API 额度。\n'
                    f'今日估算 ¥{u["cost"]:.4f} / ¥{self.c["daily_budget_rmb"]:.2f}；'
                    f'调用 {u["calls"]} 次，其中插话 {u["casual_calls"]} 次。\n'
                    f'普通插话：上次回复后至少 {self.c["casual_min_messages"]} 条消息、'
@@ -314,7 +502,8 @@ class Whale(discord.Client):
                 reply={'暂停':'好啦，我先潜水。','恢复':'鲸鱼娘回来了。','清空上下文':'本频道短期上下文已清空。'}[cmd]
         else:
             reply='不认识这个命令，发送 !鲸鱼 帮助 查看用法。'
-        await self.notice(m,reply,interval=0)
+        sent=await self.notice(m,reply,interval=0)
+        self.local.db.remember_reply(getattr(sent,'id',None),m.guild.id,m.channel.id,cmd)
         return True
 
     async def on_message(self,m):
@@ -323,7 +512,7 @@ class Whale(discord.Client):
         text=m.content.strip()
         if await self.command(m,text):
             return
-        if not text or self.store.pref(f'paused:{m.channel.id}')=='1':
+        if not text:
             return
         assert self.user is not None
         direct=any(u.id==self.user.id for u in m.mentions)
@@ -331,6 +520,41 @@ class Whale(discord.Client):
         if target is not None:
             direct=direct or target.author.id==self.user.id
         clean=re.sub(rf'<@!?{self.user.id}>','',text).strip() or '鲸鱼娘，在吗？'
+        if direct and self.local.split_command(clean) is not None:
+            public=self.shareable(m.channel) if clean.startswith('群规 ') else False
+            result=self.local.execute(m.guild.id,m.channel.id,m.author.id,clean,admin=self.admin(m),public=public)
+            await self.send_local(m,result)
+            return
+        action=natural_command(text,self.user.id,getattr(self.user,'name','鲸鱼娘'))
+        if action and not any(u.id!=self.user.id for u in m.mentions) and (not m.reference or direct):
+            result=self.local.execute(m.guild.id,m.channel.id,m.author.id,action,natural=True)
+            await self.send_local(m,result)
+            return
+        ref=m.reference
+        if (clean.isdigit() and len(clean)<=3 and not any(u.id!=self.user.id for u in m.mentions) and
+                (not ref or direct) and self.local.db.game(m.guild.id,m.channel.id,m.author.id)):
+            result=self.local.execute(m.guild.id,m.channel.id,m.author.id,'猜数字 '+clean)
+            await self.send_local(m,result)
+            return
+        if ref and (not ref.channel_id or ref.channel_id==m.channel.id):
+            previous=self.local.db.reply_command(ref.message_id,m.guild.id,m.channel.id)
+            if previous is not None:
+                result=LocalResult('这是本地工具回复；发送 !鲸鱼 工具 查看用法。想聊天可以另发新消息 @我。')
+                if clean in ('再来一次','再来','再掷一次','再选一次','再摸一下','再喂一口'):
+                    parsed=self.local.split_command(previous)
+                    if parsed and parsed[0] in ('掷骰','骰子','抽签','选择','选一个','摸摸','投喂','喂饭','喂米饭'):
+                        result=self.local.execute(m.guild.id,m.channel.id,m.author.id,previous)
+                await self.send_local(m,result)
+                return
+        if self.store.pref(f'paused:{m.channel.id}')=='1':
+            return
+        if not self.c.get('chat_enabled',True):
+            if self.c['auto_memory_enabled'] and self.memory_on(m):
+                record_memory(self.store.db,m.id,m.guild.id,m.channel.id,m.author.id,
+                    m.author.display_name,safe_text(text),public=self.shareable(m.channel))
+            if direct:
+                await self.notice(m,'云端聊天已关闭，可以用 !鲸鱼 工具 和我玩。')
+            return
         followup=False
         if direct:
             active=self.dialogue.active.get(m.channel.id)
