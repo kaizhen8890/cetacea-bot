@@ -36,6 +36,8 @@
   "input_chars": 1000,
   "max_output_tokens": 80,
   "explanation_max_output_tokens": 500,
+  "long_output_tokens": 2048,
+  "long_auto_continue": 1,
   "max_prompt_bytes": 7000,
   "reply_delay_seconds": 2.0,
   "reply_batch_max_wait_seconds": 12.0,

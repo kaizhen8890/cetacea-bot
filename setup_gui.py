@@ -42,6 +42,13 @@ def provider_form_settings(config,values,extra_text):
     if any(x in api for x in '\r\n') or (c.get('chat_enabled',True) and not api and not local_api(c['api_base'])):
         raise ValueError('请填写单行模型 API 密钥；本机接口可以留空。')
     c['local_features']=configured_features(c)
+    try:
+        c['long_output_tokens']=int(values.get('long_output_tokens',c.get('long_output_tokens',2048)))
+        c['long_auto_continue']=int(values.get('long_auto_continue',c.get('long_auto_continue',1)))
+    except (ValueError,TypeError):
+        raise ValueError('长回答额度和自动续写次数请填写整数。') from None
+    if not 256<=c['long_output_tokens']<=8192 or c['long_auto_continue'] not in (0,1):
+        raise ValueError('长回答额度须为256—8192 tokens；自动续写次数为0或1。')
     c.pop('input_usd_per_million',None)
     c.pop('output_usd_per_million',None)
     c.pop('api_key',None)
@@ -222,6 +229,12 @@ def main():
               '例如 {"temperature": 0.6}；{"temperature": null} 会移除该参数。\n'
               '模型、消息、流式开关和输出长度由机器人控制，不能在这里覆盖。',
               foreground='#555555',wraplength=710).pack(anchor='w',pady=12)
+    long_form=ttk.Frame(advanced_tab)
+    long_form.pack(fill='x')
+    entry(long_form,0,'long_output_tokens','长回答输出额度（tokens）',str(c.get('long_output_tokens',2048)))
+    entry(long_form,1,'long_auto_continue','截断后自动续写次数',str(c.get('long_auto_continue',1)),choices=['0','1'])
+    ttk.Label(advanced_tab,text='适用于作文、翻译和讲解；每日预算仍然有效。长文自动分段或附文本文件。',
+              foreground='#555555',wraplength=710).pack(anchor='w',pady=7)
     previous_base={'value':c['api_base']}
     def base_changed(*args):
         try:

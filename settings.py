@@ -49,6 +49,8 @@ def load_settings(require_discord=False):
     c.setdefault('auto_memory_prompt',True)
     c.setdefault('reply_batch_max_wait_seconds',12.0)
     c.setdefault('reply_batch_max_messages',32)
+    c.setdefault('long_output_tokens',2048)
+    c.setdefault('long_auto_continue',1)
     for name in ('daily_budget_rmb',
                  'usd_to_rmb', 'cost_margin', 'api_timeout_seconds',
                  'reply_delay_seconds','reply_batch_max_wait_seconds'):
@@ -65,8 +67,11 @@ def load_settings(require_discord=False):
             raise ValueError(f'{name} 必须为正整数')
     if c['reply_batch_max_messages']>64 or c['reply_batch_max_wait_seconds']<c['reply_delay_seconds']*1.5:
         raise ValueError('分段合并最多64条，最长等待须不小于短消息的停顿时间')
-    if max(c['max_output_tokens'],c['explanation_max_output_tokens']) > 1024 or c['max_prompt_bytes'] > 20000:
-        raise ValueError('本程序的节省模式限制输出最多1024 tokens、输入20000字节')
+    if (type(c['long_output_tokens']) is not int or not 256<=c['long_output_tokens']<=8192
+            or type(c['long_auto_continue']) is not int or c['long_auto_continue'] not in (0,1)):
+        raise ValueError('长回答上限须为256—8192 tokens；自动续写次数为0或1')
+    if max(c['max_output_tokens'],c['explanation_max_output_tokens']) > 8192 or c['max_prompt_bytes'] > 20000:
+        raise ValueError('输出最多8192 tokens、输入20000字节；实际调用仍受每日预算限制')
     c['api_key'] = os.getenv('LLM_API_KEY', '').strip()
     c['discord_token'] = os.getenv('DISCORD_TOKEN', '').strip()
     c['persona'] = (ROOT / 'persona.txt').read_text(encoding='utf-8').strip()

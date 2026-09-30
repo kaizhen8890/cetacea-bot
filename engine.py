@@ -147,6 +147,13 @@ def cost_rmb(c, prompt, completion):
 class APIError(Exception):
     pass
 
+
+class ModelReply(str):
+    def __new__(cls,text,truncated=False):
+        value=super().__new__(cls,text)
+        value.truncated=truncated
+        return value
+
 class Context:
     def __init__(self, c):
         self.c = c
@@ -168,12 +175,16 @@ class Context:
 
     def build(self, channel, current_ids, name, text, memories, owner=False,
               recent=None, reference=None, explain=False, continuation=False,
-              auto_memories=None):
+              auto_memories=None,longform=False):
         c = self.c
         now = time.monotonic()
         guidance = ('\n同一群友的连续分段消息应结合完整意思理解，单字拆开的词不要逐字回答。' +
                     ('\n本次是解释或教学请求：认真回答问题，必要时分段说明，可以写长一些。'
-                    if explain else '\n本次是日常聊天：尽量只回一句，约3—20个汉字。'))
+                    if explain or longform else '\n本次是日常聊天：尽量只回一句，约3—20个汉字。'))
+        if longform:
+            guidance += ('\n本次是写作、翻译或完整讲解任务：不受日常3—20字的要求限制，'
+                         '按用户要求的长度完成正文；正文使用任务所需语言，外语作文和翻译保留外语。'
+                         '直接完成任务，不凑篇幅、不添加无关人设玩笑。')
         if reference:
             guidance += ('\n本次是明确回复：“正在回复的消息”是当前发言的主要对象；'
                          '只发 emoji 或短词时也结合该引用理解。频道近期聊天和记忆仅作辅助，'
@@ -195,7 +206,7 @@ class Context:
                 {'群友':row['name'],'发言':row['text']}, ensure_ascii=False)
             messages.append({'role':row['role'],'content':body})
         payload = {'群友':clip(name,32),'本服务器中该群友主动保存且当前可用的记忆':memories,
-                   '当前发言':clip(safe_text(text),c['input_chars'])}
+                   '当前发言':safe_text(text) if longform else clip(safe_text(text),c['input_chars'])}
         if auto_memories:
             payload['相关旧事']=[{'来源':'亲自交谈' if x['kind']!='glance' else '旁观印象',
                               '内容':clip(x['text'],200)} for x in auto_memories]
@@ -299,7 +310,7 @@ class LLM:
                 raise APIError('接口暂时休息中，稍后再叫我吧。')
             c=self.c
             max_tokens=c['max_output_tokens'] if max_tokens is None else max_tokens
-            if not isinstance(max_tokens,int) or not 0<max_tokens<=1024:
+            if not isinstance(max_tokens,int) or not 0<max_tokens<=8192:
                 raise APIError('输出长度设置无效。')
             bound=prompt_bytes(messages)
             if bound>c['max_prompt_bytes']:
@@ -331,9 +342,7 @@ class LLM:
                 if not content:
                     raise APIError('模型只返回了思考内容，请检查非思考模式设置。')
                 self.failures=0
-                if choice.get('finish_reason')=='length':
-                    content+='\n（这次触及短回复上限啦，可以让我继续。）'
-                return safe_text(content)
+                return ModelReply(safe_text(content),truncated=choice.get('finish_reason')=='length')
             except BaseException as exc:
                 self.store.finish(call_id,status='failed')
                 if isinstance(exc,asyncio.CancelledError):

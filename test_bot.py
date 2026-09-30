@@ -290,10 +290,11 @@ class APITests(unittest.IsolatedAsyncioTestCase):
             await LLM(self.c,self.s,session).chat(self.messages)
         self.assertNotIn('secret',str(cm.exception))
 
-    async def test_missing_usage_retains_reserve_and_length_notice(self):
+    async def test_missing_usage_retains_reserve_and_truncation_metadata(self):
         session=FakeSession(FakeResponse(data={'choices':[{'message':{'content':'你好'},'finish_reason':'length'}]}))
         result=await LLM(self.c,self.s,session).chat(self.messages)
-        self.assertIn('上限',result)
+        self.assertEqual(result,'你好')
+        self.assertTrue(result.truncated)
         self.assertGreater(self.s.usage()['cost'],0)
 
     async def test_empty_reply_is_error_without_retry(self):
@@ -502,7 +503,7 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
         self.bot.llm.chat.assert_awaited_once()
         payload=json.loads(self.bot.llm.chat.call_args.args[0][-1]['content'])
         self.assertIn('电磁感应是什么原理呢',payload['当前发言'])
-        self.assertEqual(self.bot.llm.chat.call_args.kwargs['max_tokens'],500)
+        self.assertEqual(self.bot.llm.chat.call_args.kwargs['max_tokens'],2048)
         first.channel.send.assert_awaited_once()
 
     async def test_fragments_arriving_during_history_use_only_one_cloud_call(self):
@@ -710,7 +711,7 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('电磁感应',str(messages))
         self.assertIn('正在回复的消息',messages[-1]['content'])
         self.assertIn('上一级引用',messages[-1]['content'])
-        self.assertEqual(self.bot.llm.chat.call_args.kwargs['max_tokens'],500)
+        self.assertEqual(self.bot.llm.chat.call_args.kwargs['max_tokens'],2048)
         self.assertNotIn('<:saya_ok:123>',current.channel.send.call_args.args[0])
 
     async def test_history_respects_memory_opt_out_and_clear_cutoff(self):

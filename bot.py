@@ -19,6 +19,8 @@ from memory_worker import model_ready, resource_ready
 from local_features import LocalFeatures,LocalResult,TOOL_HELP,natural_command,poll_text
 from local_discord import LocalCommandTree,LocalActionView,LocalPollView,command_group
 from wordle_discord import WordleService,is_wordle
+from long_answers import writing_request,continue_request
+from long_discord import LongAnswers
 
 LOG=logging.getLogger('cetacea')
 HELP=('🐳 我是 DeepSeek 鲸鱼娘。@我或回复我开始聊天；我会接上两分钟内的自然追问。平时也会偶尔插话、用群内表情。\n'
@@ -59,6 +61,7 @@ class Whale(discord.Client):
         self.llm=None
         self.local=LocalFeatures(c,store)
         self.wordle=WordleService(self)
+        self.long_answers=LongAnswers(self)
         self.tree=LocalCommandTree(self)
         self.tree.add_command(command_group(self))
 
@@ -68,6 +71,7 @@ class Whale(discord.Client):
         self.local.db.recover()
         self.local.db.prune()
         self.wordle.restore()
+        self.long_answers.restore()
         for row in self.local.db.open_polls():
             gid,cid=int(row['guild']),int(row['channel'])
             if cid in self.allowed_channels.get(gid,()):
@@ -96,6 +100,7 @@ class Whale(discord.Client):
             task.cancel()
         if self.workers:
             await asyncio.gather(*self.workers.values(),return_exceptions=True)
+        await self.long_answers.close()
         if self.session:
             await self.session.close()
         await super().close()
@@ -227,12 +232,21 @@ class Whale(discord.Client):
 
     async def recent_history(self,m,before):
         rows=[]
+        seen_answers=set()
         try:
             async for old in m.channel.history(limit=max(40,self.c['context_messages']*8),before=before):
                 if not self._historical_allowed(m,old):
                     continue
+                answer=self.long_answers.by_message(old.id,m.guild.id,m.channel.id,self.memory_on(m))
+                text=old.content
+                if answer and old.author.id==self.user.id:
+                    token=(answer['volatile'],answer['id'])
+                    if token in seen_answers:
+                        continue
+                    seen_answers.add(token)
+                    text=self.long_answers.summary(answer)
                 rows.append(dict(mid=old.id,uid=old.author.id,name=clip(old.author.display_name,32),
-                    text=clip(safe_text(old.content),self.c['context_chars_per_message']),
+                    text=clip(safe_text(text),self.c['context_chars_per_message']),
                     role='assistant' if old.author.id==self.user.id else 'user',
                     time=old.created_at.timestamp() if getattr(old,'created_at',None) else 0,
                     break_before=bool(old.reference or old.mentions)))
@@ -404,6 +418,7 @@ class Whale(discord.Client):
                 if time.time()>=prune_at:
                     self.local.db.prune()
                     await self.wordle.prune()
+                    self.long_answers.prune()
                     prune_at=time.time()+3600
             except asyncio.CancelledError:
                 raise
@@ -467,9 +482,11 @@ class Whale(discord.Client):
         elif cmd.startswith('忘记 '):
             self.store.forget(*scope,cmd[3:].strip())
             self.context.forget_user(m.channel.id,m.author.id)
+            self.long_answers.erase_user(m.guild.id,m.author.id)
             self.store.set_pref(self.history_key(m),str(m.id))
             reply='这条记忆已删除，也清掉了你的近期发言上下文。'
         elif cmd in ('清空记忆','关闭记忆'):
+            self.long_answers.erase_user(m.guild.id,m.author.id)
             erase_user(self.store.db,m.guild.id,m.author.id)
             self.store.set_pref(f'memory_reset_at:{m.guild.id}:{m.author.id}',str(time.time()))
             for channel_id in self.allowed_channels.get(m.guild.id,()):
@@ -497,6 +514,7 @@ class Whale(discord.Client):
                 reply='这个命令需要服务器管理权限或本机指定的主人身份。'
             else:
                 if cmd=='清空上下文':
+                    self.long_answers.erase_channel(m.guild.id,m.channel.id)
                     self.context.items.pop(m.channel.id,None)
                     self.dialogue.clear(m.channel.id)
                     self.store.set_pref(self.context_key(m),str(m.id))
@@ -573,6 +591,8 @@ class Whale(discord.Client):
             if direct:
                 await self.notice(m,'云端聊天已关闭，可以用 !鲸鱼 工具 和我玩。')
             return
+        if continue_request(clean) and self.long_answers.find(m):
+            direct=True
         followup=False
         if direct:
             active=self.dialogue.active.get(m.channel.id)
@@ -633,6 +653,17 @@ class Whale(discord.Client):
                     m=batch[-1][0]
                     if self.store.pref(f'paused:{m.channel.id}')=='1':
                         return
+                    current=join_fragments(t for _,t,_ in batch)
+                    answer=self.long_answers.find(m) if continue_request(current) else None
+                    if answer:
+                        try:
+                            await self.long_answers.resume(m,answer,is_current=lambda:burst.version==version)
+                        except MessageChanged:
+                            burst.restore(batch)
+                            continue
+                        burst.complete()
+                        rounds+=1
+                        continue
                     memories=self.personal_memories(m) if self.memory_on(m) else []
                     recent=await self.recent_history(m,batch[0][0])
                     # Use the newest explicit reply, including an unreadable one, so
@@ -645,6 +676,9 @@ class Whale(discord.Client):
                         reference={'群友':clip(target.author.display_name,32),
                             '发言':clip(safe_text(target.content),self.c['context_chars_per_message'])}
                         quoted_ids.add(target.id)
+                        article=self.long_answers.by_message(target.id,m.guild.id,m.channel.id,self.memory_on(m))
+                        if article:
+                            reference['所属长回答的原题']=clip(article['prompt'],500)
                         # Discord replies may form a chain: the bot's short answer often
                         # points back to the question the user is following up on.
                         parent=await self.reply_target(target)
@@ -652,7 +686,6 @@ class Whale(discord.Client):
                             reference['上一级引用']={'群友':clip(parent.author.display_name,32),
                                 '发言':clip(safe_text(parent.content),self.c['context_chars_per_message'])}
                             quoted_ids.add(parent.id)
-                    current=join_fragments(t for _,t,_ in batch)
                     history=compact_history(recent or [],self.c['context_chars_per_message'])
                     if reference is not None:
                         # Retrieve memories about the selected conversation, rather
@@ -664,11 +697,13 @@ class Whale(discord.Client):
                     auto_memories=(retrieve_memory(self.store.db,m.guild.id,m.channel.id,
                         m.author.id,retrieval_query,limit=3) if self.c['auto_memory_enabled'] and self.memory_on(m) else [])
                     explain=explanation_request(current)
+                    longform=(explain or writing_request(current) or (continue_request(current) and reference and
+                        writing_request(str(reference)))) and kind!='casual'
                     excluded={x.id for x,_,_ in batch}|quoted_ids
                     messages=self.context.build(m.channel.id,excluded,m.author.display_name,
                         current,memories,m.author.id==int(self.c['owner_id']),recent=recent,
                         reference=reference,explain=explain,continuation=kind=='continuation',
-                        auto_memories=auto_memories)
+                        auto_memories=auto_memories,longform=bool(longform))
                     # Rebuild for new fragments before a paid request, including while
                     # waiting behind another server's cloud call.
                     if burst.version!=version:
@@ -677,7 +712,7 @@ class Whale(discord.Client):
                     try:
                         async with m.channel.typing():
                             result=await self.llm.chat(messages,kind,
-                                max_tokens=self.c['explanation_max_output_tokens'] if explain else self.c['max_output_tokens'],
+                                max_tokens=self.c.get('long_output_tokens',2048) if longform else self.c['max_output_tokens'],
                                 is_current=lambda:burst.version==version)
                     except MessageChanged:
                         burst.restore(batch)
@@ -693,6 +728,15 @@ class Whale(discord.Client):
                         return
                     if kind=='continuation' and result.strip()=='[[NO_REPLY]]':
                         self.dialogue.clear(m.channel.id)
+                        continue
+                    if longform or getattr(result,'truncated',False) or len(result.encode('utf-16-le'))//2>1800:
+                        prompt=current
+                        if reference:
+                            prompt+='\n用户引用的内容：'+str(reference)[:1000]
+                        await self.long_answers.begin(m,prompt,result,[x.id for x,_,_ in batch],
+                            auto=bool(longform),is_current=lambda:burst.version==version)
+                        if self.c['auto_memory_enabled'] and self.memory_on(m):
+                            mark_engaged(self.store.db,[x.id for x,_,_ in batch])
                         continue
                     emote='' if explain else choose_emote(current+' '+result,
                         self.available_emotes.get(m.guild.id,{}),
@@ -718,6 +762,8 @@ class Whale(discord.Client):
             LOG.info('回复未完成：%s',type(exc).__name__)
         except discord.HTTPException:
             LOG.warning('Discord 消息发送失败；不会重新请求模型')
+            with contextlib.suppress(discord.HTTPException):
+                await self.long_answers.delivery_notice(m)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -728,6 +774,7 @@ class Whale(discord.Client):
             self.kinds.pop(key,None)
 
     async def on_raw_message_delete(self,payload):
+        self.long_answers.erase_message(payload.message_id)
         if self.c['auto_memory_enabled']:
             erase_message(self.store.db,payload.message_id)
         self.context.remove(payload.channel_id,payload.message_id)
