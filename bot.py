@@ -12,7 +12,7 @@ import aiohttp
 import discord
 from settings import ROOT, load_settings
 from storage import Store, BudgetExceeded
-from engine import Context, Policy, ConversationTracker, LLM, APIError, clip, safe_text, explanation_request, choose_emote, EMOTE_NAMES
+from engine import Context, Policy, ConversationTracker, LLM, APIError, MessageChanged, MessageBurst, join_fragments, compact_history, clip, safe_text, explanation_request, choose_emote, EMOTE_NAMES
 from memory import record as record_memory, mark_engaged, retrieve as retrieve_memory, erase_message, erase_user, status as memory_status, next_batch, pending_fold
 from memory_worker import model_ready, resource_ready
 
@@ -189,14 +189,14 @@ class Whale(discord.Client):
     async def recent_history(self,m,before):
         rows=[]
         try:
-            async for old in m.channel.history(limit=max(20,self.c['context_messages']*4),before=before):
+            async for old in m.channel.history(limit=max(40,self.c['context_messages']*8),before=before):
                 if not self._historical_allowed(m,old):
                     continue
                 rows.append(dict(mid=old.id,uid=old.author.id,name=clip(old.author.display_name,32),
                     text=clip(safe_text(old.content),self.c['context_chars_per_message']),
-                    role='assistant' if old.author.id==self.user.id else 'user',time=0))
-                if len(rows)>=self.c['context_messages']:
-                    break
+                    role='assistant' if old.author.id==self.user.id else 'user',
+                    time=old.created_at.timestamp() if getattr(old,'created_at',None) else 0,
+                    break_before=bool(old.reference or old.mentions)))
             rows.reverse()
             return rows
         except (discord.HTTPException,AttributeError):
@@ -345,18 +345,20 @@ class Whale(discord.Client):
                 public=self.shareable(m.channel))
         # Short-term context is volatile. Opt-out also excludes future passive caching.
         if self.memory_on(m):
-            self.context.add(m.channel.id,m.id,m.author.id,m.author.display_name,clean)
+            self.context.add(m.channel.id,m.id,m.author.id,m.author.display_name,clean,
+                             break_before=bool(m.reference or m.mentions))
         self.policy.observe(m.channel.id)
         key=(m.channel.id,m.author.id)
         if key in self.workers:
+            # A new message addressed to someone else is a separate conversation.
+            if not direct and (m.reference is not None or m.mentions):
+                return
             if direct:
                 self.kinds[key]='mention'
             elif followup and self.kinds.get(key)=='casual':
                 self.kinds[key]='continuation'
             batch=self.pending[key]
-            if len(batch)<8:
-                batch.append((m,clean,target))
-            elif direct:
+            if not batch.append((m,clean,target)) and direct:
                 await self.notice(m,'消息太密啦，等我回完这一轮再聊。')
             return
         if not direct and not followup:
@@ -366,21 +368,26 @@ class Whale(discord.Client):
             if direct or followup:
                 await self.notice(m,'现在有点忙，稍后再叫我吧。')
             return
-        self.pending[key]=[(m,clean,target)]
+        self.pending[key]=MessageBurst(self.c)
+        self.pending[key].append((m,clean,target))
         kind='mention' if direct else 'continuation' if followup else 'casual'
         self.kinds[key]=kind
         self.workers[key]=asyncio.create_task(self.respond(key,kind))
 
     async def respond(self,key,kind):
         try:
-            await asyncio.sleep(self.c['reply_delay_seconds'])
+            burst=self.pending[key]
+            await burst.wait()
             # A short bounded queue serializes replies per channel; API calls are globally serial.
             async with self.channel_locks[key[0]]:
                 rounds=0
-                while self.pending.get(key) and rounds<3:
+                while burst.items and rounds<3:
+                    await burst.wait()
                     kind=self.kinds.get(key,kind)
-                    batch=self.pending[key][:]
-                    self.pending[key].clear()
+                    version=burst.version
+                    batch=burst.take()
+                    if not batch:
+                        break
                     m=batch[-1][0]
                     if self.store.pref(f'paused:{m.channel.id}')=='1':
                         return
@@ -397,8 +404,9 @@ class Whale(discord.Client):
                         if parent is not None and parent.id!=target.id and self._historical_allowed(m,parent):
                             reference['上一级引用']={'群友':clip(parent.author.display_name,32),
                                 '发言':clip(safe_text(parent.content),self.c['context_chars_per_message'])}
-                    current='\n'.join(t for _,t,_ in batch)
-                    retrieval_query=current+' '+ ' '.join(r['text'] for r in (recent or [])[-2:])
+                    current=join_fragments(t for _,t,_ in batch)
+                    history=compact_history(recent or [],self.c['context_chars_per_message'])
+                    retrieval_query=current+' '+ ' '.join(r['text'] for r in history[-2:])
                     auto_memories=(retrieve_memory(self.store.db,m.guild.id,m.channel.id,
                         m.author.id,retrieval_query,limit=3) if self.c['auto_memory_enabled'] and self.memory_on(m) else [])
                     explain=explanation_request(current)
@@ -409,14 +417,30 @@ class Whale(discord.Client):
                         current,memories,m.author.id==int(self.c['owner_id']),recent=recent,
                         reference=reference,explain=explain,continuation=kind=='continuation',
                         auto_memories=auto_memories)
-                    async with m.channel.typing():
-                        result=await self.llm.chat(messages,kind,
-                            max_tokens=self.c['explanation_max_output_tokens'] if explain else self.c['max_output_tokens'])
+                    # Rebuild for new fragments before a paid request, including while
+                    # waiting behind another server's cloud call.
+                    if burst.version!=version:
+                        burst.restore(batch)
+                        continue
+                    try:
+                        async with m.channel.typing():
+                            result=await self.llm.chat(messages,kind,
+                                max_tokens=self.c['explanation_max_output_tokens'] if explain else self.c['max_output_tokens'],
+                                is_current=lambda:burst.version==version)
+                    except MessageChanged:
+                        burst.restore(batch)
+                        continue
+                    rounds+=1
+                    if burst.version!=version:
+                        # The provider already answered an incomplete sentence. Hold
+                        # that stale reply and use the whole utterance next round.
+                        burst.restore(batch)
+                        continue
+                    burst.complete()
                     if self.store.pref(f'paused:{m.channel.id}')=='1':
                         return
                     if kind=='continuation' and result.strip()=='[[NO_REPLY]]':
                         self.dialogue.clear(m.channel.id)
-                        rounds+=1
                         continue
                     emote='' if explain else choose_emote(current+' '+result,
                         self.available_emotes.get(m.guild.id,{}),
@@ -434,9 +458,8 @@ class Whale(discord.Client):
                     if kind!='casual':
                         self.dialogue.mark_reply(m.channel.id,m.author.id,getattr(sent,'id',0))
                     self.policy.replied(m.channel.id)
-                    rounds+=1
-                if self.pending.get(key):
-                    await self.notice(self.pending[key][-1][0],'这轮消息有点多，后面的内容请再叫我一次。')
+                if burst.items:
+                    await self.notice(burst.items[-1][0],'这轮消息有点多，后面的内容请再叫我一次。')
         except (BudgetExceeded,APIError) as exc:
             if kind!='casual':
                 await self.notice(m,str(exc))
@@ -459,7 +482,7 @@ class Whale(discord.Client):
         self.dialogue.remove_reply(payload.channel_id,payload.message_id)
         for key,batch in list(self.pending.items()):
             if key[0]==payload.channel_id:
-                self.pending[key]=[(m,t,r) for m,t,r in batch if m.id!=payload.message_id]
+                batch.remove(payload.message_id)
 
     async def on_raw_message_edit(self,payload):
         # Edited messages do not trigger a paid call, and old text is not reused.

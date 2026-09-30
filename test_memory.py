@@ -1,7 +1,10 @@
 import sqlite3
 import unittest
+import json
+from unittest.mock import patch
 
 from memory import install,record,next_batch,save_summary,retrieve,erase_user,erase_message,save_long,pending_fold,status
+from memory_worker import summarize
 
 
 class MemoryTests(unittest.TestCase):
@@ -77,6 +80,20 @@ class MemoryTests(unittest.TestCase):
         record(self.db,2,20,200,8,'小红','第二个服务器',created=100)
         self.assertEqual(status(self.db,10)['pending'],1)
         self.assertEqual(status(self.db,20)['pending'],1)
+
+    def test_local_summary_sees_whole_utterance_and_keeps_raw_sources(self):
+        for mid,text in enumerate(['电','磁','感','应','是','什','么'],1):
+            record(self.db,mid,10,100,7,'小明',text,engaged=True,created=100+mid)
+        rows=next_batch(self.db,now=2000)
+        result={'body':'小明询问电磁感应','keywords':['电磁感应']}
+        with patch('memory_worker.local_request',return_value={
+                'message':{'content':json.dumps(result,ensure_ascii=False)}}) as local:
+            summary=summarize('local-test-model','conversation',rows)
+        payload=json.loads(local.call_args.args[1]['messages'][1]['content'])
+        self.assertEqual(payload,[{'speaker':'小明','role':'user','text':'电磁感应是什么'}])
+        save_summary(self.db,rows,summary)
+        sources=json.loads(self.db.execute('SELECT source_ids FROM auto_memories').fetchone()[0])
+        self.assertEqual(len(sources),7)
 
 
 if __name__=='__main__':

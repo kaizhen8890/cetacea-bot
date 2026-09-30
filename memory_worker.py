@@ -10,6 +10,7 @@ import urllib.request
 from pathlib import Path
 
 from memory import StaleSource, install, next_batch, pending_fold, save_long, save_summary
+from engine import compact_history
 from settings import ROOT
 
 API='http://127.0.0.1:11434/api'
@@ -107,7 +108,9 @@ def summarize(model, kind, rows):
                           'source_summary_ids':{'type':'array','items':{'type':'integer'}}},
             'required':['body','keywords','source_summary_ids']}}},'required':['items']}
     else:
-        lines=[{'speaker':r['name'],'role':r['role'],'text':r['body'][:320]} for r in rows]
+        compact=compact_history([dict(uid=r['author'],name=r['name'],role=r['role'],
+            text=r['body'][:320],time=r['created']) for r in rows],max_chars=1000)
+        lines=[{'speaker':r['name'],'role':r['role'],'text':r['text']} for r in compact]
         instruction=('你是聊天记忆整理器。必须把鲸鱼娘亲自参与的对话写成非空中文摘要；'
                      '保留关键问题、明确偏好、约定、更正及未完成事项，最多 180 字。'
                      if kind=='conversation' else

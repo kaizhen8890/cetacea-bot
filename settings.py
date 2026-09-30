@@ -41,8 +41,11 @@ def load_settings(require_discord=False):
     c.setdefault('auto_memory_enabled',False)
     c.setdefault('local_memory_model','qwen3.5:2b-q4_K_M')
     c.setdefault('auto_memory_prompt',True)
+    c.setdefault('reply_batch_max_wait_seconds',12.0)
+    c.setdefault('reply_batch_max_messages',32)
     for name in ('daily_budget_rmb', 'input_usd_per_million', 'output_usd_per_million',
-                 'usd_to_rmb', 'cost_margin', 'api_timeout_seconds'):
+                 'usd_to_rmb', 'cost_margin', 'api_timeout_seconds',
+                 'reply_delay_seconds','reply_batch_max_wait_seconds'):
         if not isinstance(c[name], (int, float)) or not math.isfinite(c[name]) or c[name] <= 0:
             raise ValueError(f'{name} 必须为正数')
     if (not 0 < c['budget_usable_fraction'] <= 1 or
@@ -51,9 +54,11 @@ def load_settings(require_discord=False):
         raise ValueError('预算比例、插话概率或表情概率无效')
     for name in ('max_output_tokens','explanation_max_output_tokens','max_prompt_bytes','daily_call_limit','context_messages',
                  'conversation_followup_seconds',
-                 'context_chars_per_message','input_chars','memory_max_items'):
+                 'context_chars_per_message','input_chars','memory_max_items','reply_batch_max_messages'):
         if not isinstance(c[name], int) or c[name] <= 0:
             raise ValueError(f'{name} 必须为正整数')
+    if c['reply_batch_max_messages']>64 or c['reply_batch_max_wait_seconds']<c['reply_delay_seconds']*1.5:
+        raise ValueError('分段合并最多64条，最长等待须不小于短消息的停顿时间')
     if max(c['max_output_tokens'],c['explanation_max_output_tokens']) > 1024 or c['max_prompt_bytes'] > 20000:
         raise ValueError('本程序的节省模式限制输出最多1024 tokens、输入20000字节')
     if not c['api_base'].startswith('https://'):

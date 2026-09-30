@@ -13,6 +13,106 @@ def safe_text(text):
     text = re.sub(r'sk-[A-Za-z0-9_-]{16,}', '[密钥已隐藏]', text)
     return text
 
+def join_fragments(parts):
+    """Rejoin tiny Chinese fragments without flattening separate full sentences."""
+    result=[]
+    previous=''
+    for part in parts:
+        part=part.strip()
+        if not part:
+            continue
+        joined=(len(previous)<=2 and len(part)<=2 and
+                re.search(r'[\u3400-\u9fff]$',previous) and
+                re.match(r'[\u3400-\u9fff]',part))
+        if result and not joined:
+            result.append('\n')
+        result.append(part)
+        previous=part
+    return ''.join(result)
+
+
+def compact_history(rows,max_chars,gap_seconds=8):
+    """One context slot per contiguous, recent utterance by the same speaker."""
+    groups=[]
+    for row in rows:
+        previous=groups[-1] if groups else None
+        if (previous and row['role']=='user' and previous['role']=='user'
+                and row['uid']==previous['uid'] and not row.get('break_before',False)
+                and 0<=row['time']-previous['time']<=gap_seconds
+                and len(previous['parts'])<32
+                and len(join_fragments(previous['parts']+[row['text']]))<=max_chars):
+            previous['parts'].append(row['text'])
+            previous['time']=row['time']
+        else:
+            groups.append(dict(row,parts=[row['text']]))
+    return [dict(row,text=join_fragments(row['parts'])) for row in groups]
+
+
+class MessageChanged(Exception):
+    """More text arrived while this request was waiting for the cloud-call lock."""
+
+
+class MessageBurst:
+    """A bounded per-speaker queue that waits for silence, with a maximum delay."""
+    def __init__(self,c):
+        self.c=c
+        self.items=[]
+        self.changed=asyncio.Event()
+        self.started=self.updated=0.0
+        self.version=0
+        self.known=set()
+        self.deleted=set()
+        self.inflight=set()
+
+    def append(self,item):
+        if len(self.items)+len(self.inflight)>=self.c.get('reply_batch_max_messages',32):
+            return False
+        now=time.monotonic()
+        if not self.items:
+            self.started=now
+        self.updated=now
+        self.items.append(item)
+        self.known.add(item[0].id)
+        self.version+=1
+        self.changed.set()
+        return True
+
+    async def wait(self):
+        while self.items:
+            # Single words/characters are more likely to have another fragment coming.
+            quiet=self.c['reply_delay_seconds']*(1.5 if len(self.items[-1][1])<=4 else 1)
+            deadline=min(self.started+self.c.get('reply_batch_max_wait_seconds',12),
+                         self.updated+quiet)
+            remaining=deadline-time.monotonic()
+            if remaining<=0:
+                return
+            self.changed.clear()
+            try:
+                await asyncio.wait_for(self.changed.wait(),remaining)
+            except TimeoutError:
+                continue
+
+    def take(self):
+        items,self.items=self.items,[]
+        self.inflight={item[0].id for item in items}
+        return items
+
+    def restore(self,items):
+        self.items=[item for item in items+self.items if item[0].id not in self.deleted]
+        self.inflight.clear()
+        self.changed.set()
+
+    def complete(self):
+        self.inflight.clear()
+
+    def remove(self,mid):
+        if mid in self.known:
+            self.deleted.add(mid)
+            self.inflight.discard(mid)
+            self.items=[item for item in self.items if item[0].id!=mid]
+            self.version+=1
+            self.changed.set()
+
 def explanation_request(text):
     """Choose a longer answer only for an explicit request to learn or explain."""
     return bool(re.search(r'解释|讲解|讲讲|教我|科普|原理|为什么|怎么理解|什么意思|如何理解|怎么做|怎么解|什么是|是什么|详细说', text))
@@ -46,28 +146,30 @@ class APIError(Exception):
 class Context:
     def __init__(self, c):
         self.c = c
-        self.items = defaultdict(lambda: deque(maxlen=c['context_messages']))
+        self.raw_limit=c['context_messages']*32
+        self.items = defaultdict(lambda: deque(maxlen=self.raw_limit))
 
-    def add(self, channel, mid, uid, name, text, role='user', now=None):
+    def add(self, channel, mid, uid, name, text, role='user', now=None,break_before=False):
         self.items[channel].append(dict(mid=mid, uid=uid, name=clip(name,32),
             text=clip(safe_text(text),self.c['context_chars_per_message']), role=role,
-            time=time.monotonic() if now is None else now))
+            time=time.monotonic() if now is None else now,break_before=break_before))
 
     def remove(self, channel, mid):
         self.items[channel] = deque((r for r in self.items[channel] if r['mid'] != mid),
-                                   maxlen=self.c['context_messages'])
+                                   maxlen=self.raw_limit)
 
     def forget_user(self, channel, uid):
         self.items[channel] = deque((r for r in self.items[channel] if r['uid'] != uid),
-                                   maxlen=self.c['context_messages'])
+                                   maxlen=self.raw_limit)
 
     def build(self, channel, current_ids, name, text, memories, owner=False,
               recent=None, reference=None, explain=False, continuation=False,
               auto_memories=None):
         c = self.c
         now = time.monotonic()
-        guidance = ('\n本次是解释或教学请求：认真回答问题，必要时分段说明，可以写长一些。'
-                    if explain else '\n本次是日常聊天：尽量只回一句，约3—20个汉字。')
+        guidance = ('\n同一群友的连续分段消息应结合完整意思理解，单字拆开的词不要逐字回答。' +
+                    ('\n本次是解释或教学请求：认真回答问题，必要时分段说明，可以写长一些。'
+                    if explain else '\n本次是日常聊天：尽量只回一句，约3—20个汉字。'))
         if continuation:
             guidance += ('\n本次只是短时间内同一位群友的新消息，未必在和你说话。'
                          '只有明显接续与你的对话、向你提问或请你做事时才回答；'
@@ -76,9 +178,10 @@ class Context:
                          '自言自语或无关新话题都只输出 [[NO_REPLY]]，不要添加别的字。')
         messages = [{'role':'system', 'content':c['persona'] +
                     ('\n当前发言者身份：主人。' if owner else '\n当前发言者身份：普通群友。') + guidance}]
-        for row in (self.items[channel] if recent is None else recent):
-            if row['mid'] in current_ids or (recent is None and now-row['time'] > c['context_ttl_seconds']):
-                continue
+        raw=[row for row in (self.items[channel] if recent is None else recent)
+             if row['mid'] not in current_ids and
+             (recent is not None or now-row['time']<=c['context_ttl_seconds'])]
+        for row in compact_history(raw,c['context_chars_per_message'])[-c['context_messages']:]:
             body = row['text'] if row['role']=='assistant' else json.dumps(
                 {'群友':row['name'],'发言':row['text']}, ensure_ascii=False)
             messages.append({'role':row['role'],'content':body})
@@ -179,8 +282,10 @@ class LLM:
         self.blocked_until=0.0
         self.failures=0
 
-    async def chat(self,messages,kind='mention',max_tokens=None):
+    async def chat(self,messages,kind='mention',max_tokens=None,is_current=None):
         async with self.lock:
+            if is_current is not None and not is_current():
+                raise MessageChanged()
             if time.monotonic()<self.blocked_until:
                 raise APIError('接口暂时休息中，稍后再叫我吧。')
             c=self.c

@@ -24,6 +24,8 @@
   "explanation_max_output_tokens": 500,
   "max_prompt_bytes": 7000,
   "reply_delay_seconds": 2.0,
+  "reply_batch_max_wait_seconds": 12.0,
+  "reply_batch_max_messages": 32,
   "conversation_followup_seconds": 120,
   "api_timeout_seconds": 45,
   "memory_enabled": true,

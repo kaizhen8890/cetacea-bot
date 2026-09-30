@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock,patch
 from settings import ROOT,load_settings,configured_servers
 from setup_gui import parse_server_lines,format_server_lines
 from storage import Store,BudgetExceeded,day_key
-from engine import Context,Policy,ConversationTracker,LLM,APIError,prompt_bytes,explanation_request,choose_emote
+from engine import Context,Policy,ConversationTracker,LLM,APIError,MessageChanged,MessageBurst,join_fragments,compact_history,prompt_bytes,explanation_request,choose_emote
 from bot import Whale
 from memory import save_summary
 
@@ -167,6 +167,28 @@ class ContextTests(unittest.TestCase):
         self.assertNotIn('其他频道秘密',str(msgs))
         self.assertEqual(str(msgs).count('最后一条'),1)
 
+    def test_fragmented_history_keeps_topic_and_rejoins_words(self):
+        ctx=Context(config())
+        ctx.add(2,1,4,'小红','我们正在讨论电磁感应')
+        parts=['我去','这个太离谱了吧','真','的','假','的','我','去','再','讲','一','遍']
+        for mid,text in enumerate(parts,2):
+            ctx.add(2,mid,3,'小明',text)
+        ctx.remove(2,12)  # Removing one raw fragment must work after compaction too.
+        msgs=ctx.build(2,set(),'小明','能举例吗',[])
+        history=[json.loads(m['content'])['发言'] for m in msgs[1:-1]]
+        self.assertEqual(len(history),2)
+        self.assertIn('电磁感应',history[0])
+        self.assertIn('真的假的我去再讲遍',history[1])
+
+    def test_compaction_respects_speakers_gaps_and_new_references(self):
+        rows=[dict(mid=i,uid=uid,name='群友',text=text,role='user',time=ts,
+                   break_before=boundary) for i,(uid,text,ts,boundary) in enumerate([
+                       (3,'真',0,False),(3,'的',1,False),(4,'是',2,False),
+                       (3,'假',3,False),(3,'的',20,False),(3,'我',21,True)])]
+        self.assertEqual([r['text'] for r in compact_history(rows,240)],
+                         ['真的','是','假','的','我'])
+        self.assertEqual(join_fragments(['New','York']), 'New\nYork')
+
     def test_old_context_expires_and_deletion_works(self):
         ctx=Context(config())
         ctx.add(2,1,3,'明','过期内容',now=0)
@@ -279,9 +301,49 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(isinstance(x,BudgetExceeded) for x in results),1)
         self.assertEqual(len(session.calls),1)
 
+    async def test_changed_queued_request_spends_no_budget(self):
+        session=FakeSession(FakeResponse())
+        llm=LLM(self.c,self.s,session)
+        current={'value':True}
+        await llm.lock.acquire()
+        task=asyncio.create_task(llm.chat(self.messages,is_current=lambda:current['value']))
+        await asyncio.sleep(0)
+        current['value']=False
+        llm.lock.release()
+        with self.assertRaises(MessageChanged):
+            await task
+        self.assertEqual(session.calls,[])
+        self.assertEqual(self.s.usage()['calls'],0)
+
 class Typing:
     async def __aenter__(self): pass
     async def __aexit__(self,*args): pass
+
+
+class BurstTests(unittest.IsolatedAsyncioTestCase):
+    async def test_continuous_typing_has_bounded_wait(self):
+        c=config()
+        c['reply_batch_max_wait_seconds']=.08
+        burst=MessageBurst(c)
+        burst.append((message(1),'真',None))
+        waiting=asyncio.create_task(burst.wait())
+        for mid in range(2,13):
+            await asyncio.sleep(.01)
+            burst.append((message(mid),'的',None))
+        self.assertTrue(waiting.done())
+        await waiting
+
+    async def test_deleted_inflight_fragment_is_not_reintroduced(self):
+        c=config()
+        c['reply_batch_max_messages']=2
+        burst=MessageBurst(c)
+        burst.append((message(1),'删掉的前半句',None))
+        old=burst.take()
+        burst.append((message(2),'留下的新问题',None))
+        self.assertFalse(burst.append((message(3),'第三条',None)))
+        burst.remove(1)
+        burst.restore(old)
+        self.assertEqual(join_fragments(item[1] for item in burst.items),'留下的新问题')
 
 def message(mid=1,text='<@50> 你好',uid=3,bot=False):
     author=SimpleNamespace(id=uid,bot=bot,display_name='小明',guild_permissions=SimpleNamespace(manage_guild=False))
@@ -316,6 +378,104 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
         args=self.bot.llm.chat.call_args[0][0]
         self.assertIn('今天吃什么',args[-1]['content'])
         self.assertFalse(m1.channel.send.call_args.kwargs['allowed_mentions'].everyone)
+
+    async def test_later_fragments_restart_wait_and_form_one_teaching_request(self):
+        self.bot.c['reply_delay_seconds']=.08
+        first=message(1,'<@50> 能不能帮我')
+        await self.bot.on_message(first)
+        await asyncio.sleep(.05)
+        second=message(2,'解释这个问题')
+        second.channel=first.channel
+        await self.bot.on_message(second)
+        await asyncio.sleep(.05)
+        self.bot.llm.chat.assert_not_awaited()
+        for mid,text in enumerate(['电','磁','感','应','是','什','么','原','理','呢'],3):
+            fragment=message(mid,text)
+            fragment.channel=first.channel
+            await self.bot.on_message(fragment)
+        await asyncio.gather(*self.bot.workers.values())
+        self.bot.llm.chat.assert_awaited_once()
+        payload=json.loads(self.bot.llm.chat.call_args.args[0][-1]['content'])
+        self.assertIn('电磁感应是什么原理呢',payload['当前发言'])
+        self.assertEqual(self.bot.llm.chat.call_args.kwargs['max_tokens'],500)
+        first.channel.send.assert_awaited_once()
+
+    async def test_fragments_arriving_during_history_use_only_one_cloud_call(self):
+        reading=asyncio.Event()
+        resume=asyncio.Event()
+        async def history(m,before):
+            reading.set()
+            await resume.wait()
+            return []
+        self.bot.recent_history=history
+        first=message(1,'<@50> 我想问')
+        await self.bot.on_message(first)
+        await asyncio.wait_for(reading.wait(),1)
+        second=message(2,'电磁感应')
+        second.channel=first.channel
+        await self.bot.on_message(second)
+        resume.set()
+        await asyncio.gather(*self.bot.workers.values())
+        self.bot.llm.chat.assert_awaited_once()
+        self.assertIn('电磁感应',self.bot.llm.chat.call_args.args[0][-1]['content'])
+
+    async def test_new_fragment_holds_stale_answer_and_preserves_original_question(self):
+        started=asyncio.Event()
+        resume=asyncio.Event()
+        count=0
+        async def chat(*args,**kwargs):
+            nonlocal count
+            count+=1
+            if count==1:
+                started.set()
+                await resume.wait()
+                return '这是半句的旧回复'
+            return '这是完整问题的新回复'
+        self.bot.llm.chat=AsyncMock(side_effect=chat)
+        first=message(1,'<@50> 解释一下')
+        await self.bot.on_message(first)
+        await asyncio.wait_for(started.wait(),1)
+        second=message(2,'电磁感应')
+        second.channel=first.channel
+        await self.bot.on_message(second)
+        resume.set()
+        await asyncio.gather(*self.bot.workers.values())
+        first.channel.send.assert_awaited_once()
+        self.assertEqual(first.channel.send.call_args.args[0],'这是完整问题的新回复')
+        current=json.loads(self.bot.llm.chat.call_args.args[0][-1]['content'])['当前发言']
+        self.assertIn('解释一下',current)
+        self.assertIn('电磁感应',current)
+
+    async def test_message_to_another_member_is_not_part_of_the_bot_question(self):
+        first=message(1,'<@50> 解释物理')
+        await self.bot.on_message(first)
+        other=message(2,'<@99> 今晚打游戏吗')
+        other.channel=first.channel
+        other.mentions=[SimpleNamespace(id=99)]
+        await self.bot.on_message(other)
+        await asyncio.gather(*self.bot.workers.values())
+        current=json.loads(self.bot.llm.chat.call_args.args[0][-1]['content'])['当前发言']
+        self.assertEqual(current,'解释物理')
+
+    async def test_discord_history_fragments_do_not_evict_the_original_topic(self):
+        current=message(100,'<@50> 能解释刚才那个吗')
+        topic=message(1,'刚才在说电磁感应',uid=4)
+        topic.channel=current.channel
+        fragments=[]
+        for mid,text in enumerate(['我去','这个太离谱了吧','真','的','假','的','我','去','再','讲'],2):
+            old=message(mid,text)
+            old.channel=current.channel
+            fragments.append(old)
+        async def history(**kwargs):
+            for old in reversed([topic]+fragments):
+                yield old
+        current.channel.history=history
+        await self.bot.on_message(current)
+        await asyncio.gather(*self.bot.workers.values())
+        messages=self.bot.llm.chat.call_args.args[0]
+        self.assertIn('电磁感应',str(messages))
+        self.assertIn('真的假的我去再讲',str(messages))
+        self.assertEqual(len(messages),4)
 
     async def test_local_summary_is_recalled_without_cloud_summary_call(self):
         self.bot.c['auto_memory_enabled']=True
