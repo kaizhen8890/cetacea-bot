@@ -41,7 +41,7 @@ class Store:
         return dict(row)
 
     def reserve(self, amount, kind, config, day=None):
-        if not math.isfinite(amount) or amount <= 0:
+        if not math.isfinite(amount) or amount < 0:
             raise ValueError('invalid reservation')
         day = day or day_key()
         self.db.execute('BEGIN IMMEDIATE')

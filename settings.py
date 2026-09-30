@@ -3,6 +3,7 @@ import math
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+from provider import provider_settings,local_api
 
 ROOT = Path(__file__).resolve().parent
 
@@ -37,13 +38,13 @@ def configured_servers(c):
 
 def load_settings(require_discord=False):
     load_dotenv(ROOT / '.env')
-    c = json.loads((ROOT / 'config.json').read_text(encoding='utf-8-sig'))
+    c = provider_settings(json.loads((ROOT / 'config.json').read_text(encoding='utf-8-sig')))
     c.setdefault('auto_memory_enabled',False)
     c.setdefault('local_memory_model','qwen3.5:2b-q4_K_M')
     c.setdefault('auto_memory_prompt',True)
     c.setdefault('reply_batch_max_wait_seconds',12.0)
     c.setdefault('reply_batch_max_messages',32)
-    for name in ('daily_budget_rmb', 'input_usd_per_million', 'output_usd_per_million',
+    for name in ('daily_budget_rmb',
                  'usd_to_rmb', 'cost_margin', 'api_timeout_seconds',
                  'reply_delay_seconds','reply_batch_max_wait_seconds'):
         if not isinstance(c[name], (int, float)) or not math.isfinite(c[name]) or c[name] <= 0:
@@ -61,16 +62,16 @@ def load_settings(require_discord=False):
         raise ValueError('分段合并最多64条，最长等待须不小于短消息的停顿时间')
     if max(c['max_output_tokens'],c['explanation_max_output_tokens']) > 1024 or c['max_prompt_bytes'] > 20000:
         raise ValueError('本程序的节省模式限制输出最多1024 tokens、输入20000字节')
-    if not c['api_base'].startswith('https://'):
-        raise ValueError('模型接口必须使用 HTTPS')
     c['api_key'] = os.getenv('LLM_API_KEY', '').strip()
     c['discord_token'] = os.getenv('DISCORD_TOKEN', '').strip()
     c['persona'] = (ROOT / 'persona.txt').read_text(encoding='utf-8').strip()
     c['servers'] = configured_servers(c)
     c.pop('guild_id',None)
     c.pop('channel_ids',None)
-    if not c['api_key']:
+    if not c['api_key'] and not local_api(c['api_base']):
         raise ValueError('请先填写模型 API 密钥')
+    if any('\n' in v or '\r' in v for v in (c['api_key'],c['discord_token'])):
+        raise ValueError('密钥和 Discord Token 必须为单行文本')
     if require_discord and (not c['discord_token'] or not c['servers']):
         raise ValueError('请先完成本机配置：Discord Token 和至少一个允许聊天的服务器频道')
     return c

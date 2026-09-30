@@ -1,8 +1,8 @@
 """Local checks and explicitly requested, metered provider smoke test."""
 import argparse
 import asyncio
-import json
 import aiohttp
+from provider import fetch_model_ids
 from settings import ROOT,load_settings
 from storage import Store
 from engine import LLM
@@ -10,6 +10,7 @@ from engine import LLM
 async def check(live=False):
     c=load_settings()
     print('模型：'+c['model'])
+    print('接口：'+c['api_base'])
     if c['discord_token'] and c['servers']:
         print('Discord 配置：%s 个服务器、%s 个文字频道' %
               (len(c['servers']),sum(len(entry['channel_ids']) for entry in c['servers'])))
@@ -19,16 +20,13 @@ async def check(live=False):
     store=Store(ROOT/'data/whale.sqlite3')
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(c['api_base'].rstrip('/')+'/models',
-                headers={'Authorization':'Bearer '+c['api_key']},
-                timeout=aiohttp.ClientTimeout(total=20),allow_redirects=False) as r:
-                if r.status!=200:
-                    print('模型列表读取失败，HTTP '+str(r.status))
-                    return
-                data=await r.json()
-            found=any(m.get('id')==c['model'] for m in data.get('data',[]))
-            print('模型列表验证：'+('通过' if found else '没有找到配置的模型'))
-            if live and found:
+            try:
+                models=await asyncio.to_thread(fetch_model_ids,c['api_base'],c['api_key'])
+                print('模型列表验证：'+('通过' if c['model'] in models else
+                      '列表中未找到；仍可使用手动填写的模型名称'))
+            except ValueError as exc:
+                print(str(exc))
+            if live:
                 text=await LLM(c,store,session).chat([
                     {'role':'system','content':c['persona']},
                     {'role':'user','content':'这是机器人接入测试，请用一句中文打招呼。'}],'test')

@@ -5,6 +5,7 @@ import re
 import time
 from collections import defaultdict, deque
 import aiohttp
+from provider import provider_settings,api_headers,chat_payload
 
 def clip(text, size):
     return text if len(text) <= size else text[:size] + '…[已截短]'
@@ -137,8 +138,11 @@ def choose_emote(text, available, probability, roll=None):
     return next((available[name] for name in names if name in available),'')
 
 def cost_rmb(c, prompt, completion):
-    return ((prompt*c['input_usd_per_million'] + completion*c['output_usd_per_million'])
-            / 1_000_000 * c['usd_to_rmb'] * c['cost_margin'])
+    input_price=c.get('input_price_per_million',c.get('input_usd_per_million'))
+    output_price=c.get('output_price_per_million',c.get('output_usd_per_million'))
+    exchange=c['usd_to_rmb'] if c.get('pricing_currency','USD')=='USD' else 1
+    return ((prompt*input_price + completion*output_price)
+            / 1_000_000 * exchange * c['cost_margin'])
 
 class APIError(Exception):
     pass
@@ -277,7 +281,7 @@ class ConversationTracker:
 
 class LLM:
     def __init__(self,c,store,session):
-        self.c,self.store,self.session=c,store,session
+        self.c,self.store,self.session=provider_settings(c),store,session
         self.lock=asyncio.Lock()
         self.blocked_until=0.0
         self.failures=0
@@ -298,9 +302,8 @@ class LLM:
             call_id=self.store.reserve(cost_rmb(c,bound,max_tokens),kind,c)
             try:
                 async with self.session.post(c['api_base'].rstrip('/')+'/chat/completions',
-                    headers={'Authorization':'Bearer '+c['api_key']},
-                    json={'model':c['model'],'messages':messages,'max_tokens':max_tokens,
-                          'temperature':0.8,'stream':False,'thinking':{'type':'disabled'}},
+                    headers=api_headers(c),
+                    json=chat_payload(c,messages,max_tokens),
                     timeout=aiohttp.ClientTimeout(total=c['api_timeout_seconds']),
                     allow_redirects=False) as response:
                     if response.status!=200:
