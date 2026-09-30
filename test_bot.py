@@ -2,7 +2,7 @@ import asyncio
 import json
 import tempfile
 import unittest
-from datetime import datetime,timezone
+from datetime import datetime,timedelta,timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock,patch
@@ -166,6 +166,20 @@ class ContextTests(unittest.TestCase):
         self.assertLessEqual(prompt_bytes(msgs),c['max_prompt_bytes'])
         self.assertNotIn('其他频道秘密',str(msgs))
         self.assertEqual(str(msgs).count('最后一条'),1)
+
+    def test_explicit_reference_survives_prompt_trimming_as_user_data(self):
+        c=config(); c['max_prompt_bytes']=3000
+        ctx=Context(c)
+        for i in range(12):
+            ctx.add(2,i,i%2,'群友','附近聊天'*100)
+        reference={'群友':'鲸鱼娘','发言':'造句'*120,
+                   '上一级引用':{'群友':'小明','发言':'考试'*120}}
+        msgs=ctx.build(2,set(),'小红','👎',[],recent=None,reference=reference)
+        self.assertLessEqual(prompt_bytes(msgs),c['max_prompt_bytes'])
+        self.assertEqual(json.loads(msgs[-1]['content'])['正在回复的消息'],reference)
+        self.assertEqual(msgs[-1]['role'],'user')
+        self.assertNotIn('造句',msgs[0]['content'])
+        self.assertIn('主要对象',msgs[0]['content'])
 
     def test_fragmented_history_keeps_topic_and_rejoins_words(self):
         ctx=Context(config())
@@ -365,6 +379,97 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.close()
         self.allowed_patch.stop()
         self.s.close()
+
+    def reply_scene(self,age=None):
+        """The reported old sentence-writing reply beside a newer wallet topic."""
+        now=datetime.now(timezone.utc)
+        age=self.bot.c['context_ttl_seconds']+35 if age is None else age
+        current=message(11,'👎🏿',uid=4)
+        target=message(9,'马来文造句啦，背两个就行',uid=50,bot=True)
+        parent=message(8,'考试',uid=7)
+        wallet=message(10,'聪明了我的钱包就受罪了',uid=9)
+        for old,seconds in ((current,0),(target,age),(parent,age+2),(wallet,31)):
+            old.channel=current.channel
+            old.created_at=now-timedelta(seconds=seconds)
+        current.reference=SimpleNamespace(message_id=9,channel_id=2,resolved=None)
+        target.reference=SimpleNamespace(message_id=8,channel_id=2,resolved=None)
+        current.channel.fetch_message=AsyncMock(side_effect=lambda mid:{8:parent,9:target}[mid])
+        async def history(**kwargs):
+            for old in (wallet,target,parent):
+                yield old
+        current.channel.history=history
+        return current,target,parent,wallet
+
+    async def test_old_emoji_reply_keeps_selected_topic_and_retrieves_its_memories(self):
+        current,target,parent,wallet=self.reply_scene()
+        self.bot.c['auto_memory_enabled']=True
+        with patch.object(self.bot,'shareable',return_value=True),patch('bot.retrieve_memory',return_value=[]) as retrieve:
+            await self.bot.on_message(current)
+            await asyncio.gather(*self.bot.workers.values())
+        self.bot.llm.chat.assert_awaited_once()
+        messages=self.bot.llm.chat.call_args.args[0]
+        payload=json.loads(messages[-1]['content'])
+        self.assertEqual(payload['当前发言'],'👎🏿')
+        self.assertEqual(payload['正在回复的消息']['发言'],target.content)
+        self.assertEqual(payload['正在回复的消息']['上一级引用']['发言'],parent.content)
+        self.assertIn(wallet.content,str(messages[1:-1]))
+        self.assertNotIn(target.content,str(messages[1:-1]))
+        query=retrieve.call_args.args[4]
+        self.assertIn('造句',query)
+        self.assertIn('考试',query)
+        self.assertNotIn('钱包',query)
+        self.assertLessEqual(prompt_bytes(messages),self.bot.c['max_prompt_bytes'])
+
+    async def test_explicit_age_exception_keeps_scope_opt_out_and_clear_guards(self):
+        current,target,parent,_=self.reply_scene()
+        self.assertFalse(self.bot._historical_allowed(current,target))
+        self.assertTrue(self.bot._historical_allowed(current,target,explicit=True))
+        self.assertTrue(self.bot._historical_allowed(current,parent,explicit=True))
+        other=message(9,target.content,uid=50,bot=True)
+        other.channel=SimpleNamespace(id=4)
+        self.assertFalse(self.bot._historical_allowed(current,other,explicit=True))
+        for key,value,old in (
+                ('context_after:1:2','9',target),
+                ('history_after:1:2:50','9',target),
+                ('memory_reset_at:1:4',str(current.created_at.timestamp()-1),target),
+                ('memory_off:1:7','1',parent),
+                ('memory_off:1:2:7','1',parent),
+                ('memory_reset_at:1:7',str(current.created_at.timestamp()-1),parent)):
+            with self.subTest(key=key):
+                self.s.set_pref(key,value)
+                self.assertFalse(self.bot._historical_allowed(current,old,explicit=True))
+                self.s.set_pref(key,'0')
+        self.bot.local.db.remember_reply(9,1,2,'工具')
+        self.assertFalse(self.bot._historical_allowed(current,target,explicit=True))
+
+    async def test_cleared_explicit_quote_is_marked_unavailable_without_leaking_content(self):
+        current,target,_,_=self.reply_scene()
+        self.s.set_pref('context_after:1:2',str(target.id))
+        await self.bot.on_message(current)
+        await asyncio.gather(*self.bot.workers.values())
+        messages=self.bot.llm.chat.call_args.args[0]
+        self.assertEqual(json.loads(messages[-1]['content'])['正在回复的消息'],{'状态':'引用内容不可用'})
+        self.assertNotIn(target.content,str(messages))
+        self.assertIn('简短问清楚',messages[0]['content'])
+
+    async def test_newest_unreadable_quote_cannot_reuse_previous_quote_in_burst(self):
+        first,target,parent,_=self.reply_scene()
+        later=message(12,'<@50> 这句呢',uid=4)
+        later.channel=first.channel
+        later.reference=SimpleNamespace(message_id=99,channel_id=2,resolved=None)
+        async def fetch(mid):
+            if mid==99:
+                import discord
+                raise discord.NotFound(SimpleNamespace(status=404,reason='Not Found'),'')
+            return {8:parent,9:target}[mid]
+        first.channel.fetch_message.side_effect=fetch
+        await self.bot.on_message(first)
+        await self.bot.on_message(later)
+        await asyncio.gather(*self.bot.workers.values())
+        self.bot.llm.chat.assert_awaited_once()
+        messages=self.bot.llm.chat.call_args.args[0]
+        self.assertEqual(json.loads(messages[-1]['content'])['正在回复的消息'],{'状态':'引用内容不可用'})
+        self.assertNotIn(target.content,str(messages))
 
     async def test_mentions_merge_and_send_one_reply(self):
         m1=message(1)

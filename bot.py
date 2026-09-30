@@ -192,7 +192,7 @@ class Whale(discord.Client):
     def context_key(self,m):
         return f'context_after:{m.guild.id}:{m.channel.id}'
 
-    def _historical_allowed(self,m,old):
+    def _historical_allowed(self,m,old,*,explicit=False):
         if old.channel.id!=m.channel.id or not old.content.strip():
             return False
         own_reset=self.store.pref(f'memory_reset_at:{m.guild.id}:{m.author.id}')
@@ -219,7 +219,9 @@ class Whale(discord.Client):
             if value and value!='off' and old.id<=int(value):
                 return False
         created=getattr(old,'created_at',None)
-        if created and (datetime.now(timezone.utc)-created).total_seconds()>self.c['context_ttl_seconds']:
+        # A deliberate reply selects its own context, even after passive history expires.
+        # All scope, deletion/reset, opt-out and local-tool exclusions above still apply.
+        if not explicit and created and (datetime.now(timezone.utc)-created).total_seconds()>self.c['context_ttl_seconds']:
             return False
         return True
 
@@ -633,26 +635,36 @@ class Whale(discord.Client):
                         return
                     memories=self.personal_memories(m) if self.memory_on(m) else []
                     recent=await self.recent_history(m,batch[0][0])
-                    target=next((target for _,_,target in reversed(batch) if target is not None),None)
-                    reference=None
-                    if target is not None and self._historical_allowed(m,target):
+                    # Use the newest explicit reply, including an unreadable one, so
+                    # a failed fetch cannot silently reuse an earlier reply's target.
+                    quoted=next((item for item in reversed(batch) if item[0].reference),None)
+                    target=quoted[2] if quoted else None
+                    reference={'状态':'引用内容不可用'} if quoted else None
+                    quoted_ids=set()
+                    if target is not None and self._historical_allowed(m,target,explicit=True):
                         reference={'群友':clip(target.author.display_name,32),
                             '发言':clip(safe_text(target.content),self.c['context_chars_per_message'])}
+                        quoted_ids.add(target.id)
                         # Discord replies may form a chain: the bot's short answer often
                         # points back to the question the user is following up on.
                         parent=await self.reply_target(target)
-                        if parent is not None and parent.id!=target.id and self._historical_allowed(m,parent):
+                        if parent is not None and parent.id!=target.id and self._historical_allowed(m,parent,explicit=True):
                             reference['上一级引用']={'群友':clip(parent.author.display_name,32),
                                 '发言':clip(safe_text(parent.content),self.c['context_chars_per_message'])}
+                            quoted_ids.add(parent.id)
                     current=join_fragments(t for _,t,_ in batch)
                     history=compact_history(recent or [],self.c['context_chars_per_message'])
-                    retrieval_query=current+' '+ ' '.join(r['text'] for r in history[-2:])
+                    if reference is not None:
+                        # Retrieve memories about the selected conversation, rather
+                        # than unrelated nearby messages when the input is an emoji.
+                        retrieval_query=' '.join((current,reference.get('发言',''),
+                            reference.get('上一级引用',{}).get('发言',''))).strip()
+                    else:
+                        retrieval_query=current+' '+ ' '.join(r['text'] for r in history[-2:])
                     auto_memories=(retrieve_memory(self.store.db,m.guild.id,m.channel.id,
                         m.author.id,retrieval_query,limit=3) if self.c['auto_memory_enabled'] and self.memory_on(m) else [])
                     explain=explanation_request(current)
-                    excluded={x.id for x,_,_ in batch}
-                    if reference is not None:
-                        excluded.add(target.id)
+                    excluded={x.id for x,_,_ in batch}|quoted_ids
                     messages=self.context.build(m.channel.id,excluded,m.author.display_name,
                         current,memories,m.author.id==int(self.c['owner_id']),recent=recent,
                         reference=reference,explain=explain,continuation=kind=='continuation',
