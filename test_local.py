@@ -341,6 +341,36 @@ class LocalDiscordTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('投票',[cmd.name for cmd in group.commands])
         self.assertIn('日期',[cmd.name for cmd in group.commands])
 
+    async def test_slash_poll_exposes_separate_required_and_optional_choices(self):
+        command=self.bot.tree.get_commands()[0].get_command('投票')
+        params=command.parameters
+        self.assertEqual([p.name for p in params],['问题']+[f'选项{i}' for i in range(1,9)])
+        self.assertEqual([p.required for p in params],[True]*3+[False]*6)
+
+    async def test_slash_poll_creates_two_or_eight_choices_without_model(self):
+        command=self.bot.tree.get_commands()[0].get_command('投票')
+        for choices in (['米饭','面条'],['New York','Kuala Lumpur','炒饭，配汤','面条','饺子','粥','鱼','虾']):
+            with self.subTest(choices=choices):
+                interaction=SimpleNamespace(guild_id=1,channel_id=2,channel=SimpleNamespace(id=2,guild=SimpleNamespace(id=1)),
+                    user=SimpleNamespace(id=3,guild_permissions=SimpleNamespace(manage_guild=False)),
+                    response=SimpleNamespace(send_message=AsyncMock()),
+                    original_response=AsyncMock(return_value=SimpleNamespace(id=123)))
+                await command.callback(interaction,'今晚吃什么',*choices)
+                view=interaction.response.send_message.call_args.kwargs['view']
+                self.assertEqual([button.label for button in view.children],choices)
+                self.assertFalse(interaction.response.send_message.call_args.kwargs['ephemeral'])
+        self.bot.llm.chat.assert_not_awaited()
+        self.assertEqual(self.store.usage()['calls'],0)
+
+    async def test_slash_poll_does_not_treat_embedded_separators_as_extra_choices(self):
+        command=self.bot.tree.get_commands()[0].get_command('投票')
+        interaction=SimpleNamespace(response=SimpleNamespace(send_message=AsyncMock()))
+        for value in ('米饭 | 面条','米饭｜面条'):
+            await command.callback(interaction,'今晚吃什么',value,'饺子')
+            self.assertTrue(interaction.response.send_message.call_args.kwargs['ephemeral'])
+        self.assertEqual(self.bot.local.db.open_polls(),[])
+        self.bot.llm.chat.assert_not_awaited()
+
 
 class LocalModeSettingsTests(unittest.TestCase):
     def test_no_model_key_required_when_cloud_chat_off(self):

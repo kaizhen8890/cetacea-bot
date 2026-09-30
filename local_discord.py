@@ -135,8 +135,20 @@ def command_group(bot):
         await bot.local_interaction(interaction,'关闭功能 '+功能)
 
     @group.command(name='投票',description='发起单选投票，每人一票，可改选')
-    async def poll(interaction:discord.Interaction,问题:str,选项:str):
-        await bot.local_interaction(interaction,f'投票 {问题} | {选项}')
+    @discord.app_commands.describe(问题='投票问题，最多 100 字',
+        选项1='第一个选项，最多 40 字',选项2='第二个选项，最多 40 字',
+        选项3='第三个选项，可留空',选项4='第四个选项，可留空',
+        选项5='第五个选项，可留空',选项6='第六个选项，可留空',
+        选项7='第七个选项，可留空',选项8='第八个选项，可留空')
+    async def poll(interaction:discord.Interaction,问题:str,选项1:str,选项2:str,
+                   选项3:str|None=None,选项4:str|None=None,选项5:str|None=None,
+                   选项6:str|None=None,选项7:str|None=None,选项8:str|None=None):
+        choices=[选项1,选项2]+[x for x in (选项3,选项4,选项5,选项6,选项7,选项8)
+                              if x is not None and x.strip()]
+        if any('|' in x or '｜' in x for x in [问题]+choices):
+            await interaction.response.send_message('请分别填写每个选项；问题和单个选项不能包含 | 或 ｜。',ephemeral=True)
+            return
+        await bot.local_interaction(interaction,'投票 '+' | '.join([问题]+choices))
 
     @group.command(name='投票结果',description='查看本频道投票结果')
     async def poll_result(interaction:discord.Interaction,编号:int):
