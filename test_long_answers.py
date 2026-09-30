@@ -26,6 +26,14 @@ class SplitTests(unittest.TestCase):
         self.assertTrue(continue_request('继续！'))
         self.assertFalse(continue_request('我继续打游戏了'))
 
+    def test_full_text_requests_and_retries_are_long_tasks(self):
+        for text in ('把你映像中的孔雀东南飞全文输出出来','妈妈帮我输出一下，我需要帮忙',
+                     '请帮我输出孔雀东南飞全文','给我发来全诗','把全文发给我',
+                     '请背诵孔雀东南飞','默写这首诗','show me the complete poem'):
+            self.assertTrue(writing_request(text),text)
+        for text in ('老师今天罚我背诵了','全文太长了吧','我在看整本书'):
+            self.assertFalse(writing_request(text),text)
+
     def test_unicode_round_trip_and_budget_including_numbering(self):
         for source in ('一段说明。\n\n'*900,('A paragraph with some words.\n\n'*200),
                        ('👨‍👩‍👧‍👦👍🏿🇲🇾e\u0301 '*500),'x'*4000):
@@ -142,6 +150,21 @@ class LongFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.task()['delivered'],len(body))
         self.assertEqual(self.sent[0]['reference'].message_id,10)
         self.assertEqual(self.sent[1]['reference'].message_id,101)
+
+    async def test_full_text_retry_overrides_old_persona_refusal(self):
+        request=self.make(8,'把孔雀东南飞全文输出出来')
+        refused=self.make(9,'背不动啦，那么长，我记得开头几句而已。',uid=50,bot=True,reference=8)
+        self.history.extend((request,refused))
+        self.bot.llm.chat.return_value=ModelReply('孔雀东南飞，五里一徘徊。\n完整原文测试样例。')
+        await self.handle(self.make(10,'妈妈帮我输出一下，我需要帮忙',reference=9))
+        self.assertEqual(self.bot.llm.chat.call_args.kwargs['max_tokens'],2048)
+        messages=self.bot.llm.chat.call_args.args[0]
+        system=messages[0]['content']
+        self.assertNotIn('本次是日常聊天',system)
+        self.assertIn('此前回复若',system)
+        self.assertIn('不编造原文',system)
+        self.assertIn('孔雀东南飞全文',str(messages))
+        self.assertIsNotNone(self.task())
 
     async def test_truncated_writing_automatically_continues_once_and_manual_resume_inherits_topic(self):
         self.bot.llm.chat.side_effect=[ModelReply('第一段正文。',True),ModelReply('第二段正文。',True),ModelReply('最后的结论。')]

@@ -6,7 +6,14 @@ import unicodedata
 
 
 def writing_request(text):
-    return bool(re.search(r'写(?:一[篇封份段首个]|篇|封|份|作|作业)|帮我写|给我写|范文|作文|文章|翻译|译成|译为|改写|扩写|续写|润色|整理成|生成.*(?:代码|报告|文案)|写.*(?:代码|程序)|rumusan|karangan|\b(?:write|essay|translate|summari[sz]e)\b',text,re.I))
+    return bool(re.search(
+        r'写(?:一[篇封份段首个]|篇|封|份|作|作业)|帮我写|给我写|范文|作文|文章|翻译|译成|译为|改写|扩写|续写|润色|整理成|生成.*(?:代码|报告|文案)|写.*(?:代码|程序)|rumusan|karangan|\b(?:write|essay|translate|summari[sz]e)\b'
+        r'|(?:输出|给出|列出|贴出|发出|发来|发给|发送)[\s\S]*(?:全文|全诗|完整|全部)'
+        r'|(?:全文|全诗|完整|全部)[\s\S]*(?:输出|给出|列出|贴出|发出|发来|发给|发送)'
+        r'|(?:帮我|给我|请(?:帮我)?|麻烦(?:你)?)\s*(?:输出|贴出|列出)'
+        r'|(?:请|帮我|给我|麻烦(?:你)?|能否|可以|能不能|能)\s*(?:背诵|默写|抄写|誊写)'
+        r'|^\s*(?:背诵|默写|抄写|誊写)'
+        r'|\b(?:print|show|provide)\b[\s\S]*\b(?:full|entire|complete)\b|\brecite\b',text,re.I))
 
 
 def continue_request(text):
