@@ -52,9 +52,12 @@ def install(db):
         CREATE TABLE IF NOT EXISTS wordle_guesses (
             id INTEGER PRIMARY KEY AUTOINCREMENT, round INTEGER NOT NULL,
             user TEXT NOT NULL, name TEXT NOT NULL, word TEXT NOT NULL, marks TEXT NOT NULL,
-            request TEXT NOT NULL, created REAL NOT NULL,
+            request TEXT NOT NULL, created REAL NOT NULL, avatar TEXT,
             UNIQUE(round,word), UNIQUE(round,request));
     ''')
+    if 'avatar' not in {row['name'] for row in db.execute('PRAGMA table_info(wordle_guesses)')}:
+        with db:
+            db.execute('ALTER TABLE wordle_guesses ADD COLUMN avatar TEXT')
 
 
 class WordleStore:
@@ -160,6 +163,19 @@ class WordleStore:
         with self.db:
             self.db.execute('UPDATE wordle_rounds SET message=? WHERE id=?',(str(mid),rid))
 
+    def avatar(self,guess_id,guild,channel,key):
+        """A snapshot is scoped to this channel and never replaces an older one."""
+        if not isinstance(key,str) or not re.fullmatch(r'[0-9a-f]{64}',key):
+            raise ValueError('Invalid avatar cache key')
+        with self.db:
+            self.db.execute('''UPDATE wordle_guesses SET avatar=? WHERE id=? AND avatar IS NULL
+                AND round IN (SELECT id FROM wordle_rounds WHERE guild=? AND channel=?)''',
+                (key,guess_id,str(guild),str(channel)))
+
+    def avatar_keys(self):
+        return {row['avatar'] for row in self.db.execute(
+            'SELECT DISTINCT avatar FROM wordle_guesses WHERE avatar IS NOT NULL')}
+
     def board_round(self,mid,guild,channel):
         row=self.db.execute('SELECT id FROM wordle_rounds WHERE message=? AND guild=? AND channel=?',
                             (str(mid),str(guild),str(channel))).fetchone()
@@ -201,9 +217,9 @@ def board_text(game,full=False):
     return text[:1850]
 
 
-def render_board(game):
+def render_board(game,avatars=None):
     """Render only the visible state into a small PNG in memory, no AI or network."""
-    from PIL import Image,ImageDraw,ImageFont
+    from PIL import Image,ImageChops,ImageDraw,ImageFont,ImageOps
     chinese=False
     font_file=None
     for path in ('C:/Windows/Fonts/msyh.ttc','C:/Windows/Fonts/msyhbd.ttc',
@@ -233,10 +249,41 @@ def render_board(game):
               f'TEAM PLAY  /  {size} LETTERS  /  {used} OF {rows}'),58,font(17), '#c4d3e7')
     palette={-1:'#24334b',0:'#4c5668',1:'#b98924',2:'#20866c'}
     grid_x=(width-(size*tile+(size-1)*gap))/2
+    avatar_size=44 if size==7 else 52
+    # Larger mask first gives smooth circular edges after downsampling.
+    mask=Image.new('L',(avatar_size*4,avatar_size*4),0)
+    ImageDraw.Draw(mask).ellipse((0,0,mask.width-1,mask.height-1),fill=255)
+    mask=mask.resize((avatar_size,avatar_size),Image.Resampling.LANCZOS)
     for row in range(rows):
         guess=game['guesses'][row] if row<used else None
         y=header+row*(tile+row_gap)
-        draw.text((grid_x-17,y+tile/2),str(row+1),font=font(12),fill='#a8b8d0',anchor='mm')
+        if guess:
+            draw.rounded_rectangle((23,y-5,width-23,y+tile+17),radius=12,fill='#1a2d46',
+                outline='#3b526c' if row==used-1 else '#1a2d46',width=1)
+        draw.text((13,y+tile/2),str(row+1),font=font(11),fill='#a8b8d0',anchor='mm')
+        if guess:
+            ax,ay=28,round(y+(tile-avatar_size)/2)
+            thumb=None
+            data=(avatars or {}).get(guess.get('avatar'))
+            if data:
+                try:
+                    with Image.open(io.BytesIO(data)) as source:
+                        if source.width<=512 and source.height<=512:
+                            thumb=ImageOps.fit(source.convert('RGBA'),(avatar_size,avatar_size),
+                                               method=Image.Resampling.LANCZOS)
+                except Exception:
+                    pass
+            if thumb is None:
+                # A neutral silhouette also works for old rows and failed downloads.
+                thumb=Image.new('RGBA',(avatar_size,avatar_size),'#405775')
+                icon=ImageDraw.Draw(thumb)
+                d=avatar_size
+                icon.ellipse((d*.34,d*.18,d*.66,d*.5),fill='#d8e4f4')
+                icon.ellipse((d*.19,d*.57,d*.81,d*1.13),fill='#d8e4f4')
+            # Preserve any source transparency within the round clip.
+            alpha=ImageChops.multiply(thumb.getchannel('A'),mask)
+            im.paste(thumb,(ax,ay),alpha)
+            draw.ellipse((ax-1,ay-1,ax+avatar_size,ay+avatar_size),outline='#91aaca',width=1)
         for col in range(size):
             x=grid_x+col*(tile+gap)
             mark=guess['marks'][col] if guess else -1

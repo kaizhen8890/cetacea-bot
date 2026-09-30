@@ -5,9 +5,11 @@ import io
 import logging
 import time
 from collections import defaultdict,deque
+from pathlib import Path
 import discord
 from engine import safe_text
 from wordle import WordleStore,RULES,board_text,render_board
+from wordle_avatars import AvatarCache
 
 LOG=logging.getLogger('cetacea')
 
@@ -76,15 +78,22 @@ class WordleService:
     def __init__(self,bot):
         self.bot=bot
         self.db=WordleStore(bot.store)
+        database=next(row['file'] for row in bot.store.db.execute('PRAGMA database_list') if row['name']=='main')
+        self.avatars=AvatarCache(Path(database).parent/'wordle-avatars' if database else None)
         self.locks=defaultdict(asyncio.Lock)
         self.requests=defaultdict(deque)
 
     def restore(self):
         self.db.prune()
+        self.avatars.prune(self.db.avatar_keys())
         for row in self.db.active_boards():
             gid,cid=int(row['guild']),int(row['channel'])
             if cid in self.bot.allowed_channels.get(gid,()):
                 self.bot.add_view(WordleView(self,self.db.get(row['id'],gid,cid)),message_id=int(row['message']))
+
+    async def prune(self):
+        self.db.prune()
+        await asyncio.to_thread(self.avatars.prune,self.db.avatar_keys())
 
     def allowed(self,guild,channel):
         return (guild is not None and isinstance(channel,discord.TextChannel) and
@@ -105,11 +114,31 @@ class WordleService:
         member=getattr(channel.guild,'me',None)
         return bool(member and channel.permissions_for(member).attach_files)
 
+    async def capture_avatars(self,channel,game,member=None):
+        """Capture accepted guesses; cached guild members can fill legacy rows too."""
+        members={str(member.id):member} if member is not None else {}
+        get_member=getattr(channel.guild,'get_member',None)
+        missing={g['user'] for g in game['guesses'] if not g.get('avatar')}
+        for user in missing-members.keys():
+            candidate=get_member(int(user)) if get_member else None
+            if candidate:
+                members[user]=candidate
+        users=[user for user in missing if user in members]
+        keys=await asyncio.gather(*(self.avatars.snapshot(members[user]) for user in users))
+        snapshots=dict(zip(users,keys))
+        for guess in game['guesses']:
+            key=snapshots.get(guess['user'])
+            if key and not guess.get('avatar'):
+                self.db.avatar(guess['id'],game['guild'],game['channel'],key)
+                guess['avatar']=key
+
     async def image(self,channel,game):
         if not self.can_attach(channel):
             return None
         try:
-            return await asyncio.to_thread(render_board,game)
+            def render():
+                return render_board(game,self.avatars.images(game))
+            return await asyncio.to_thread(render)
         except Exception as exc:
             LOG.warning('Wordle 图片暂不可用，使用文字棋盘：%s',type(exc).__name__)
             return None
@@ -171,7 +200,7 @@ class WordleService:
         self.bot.local.db.remember_reply(mid,game['guild'],game['channel'],'wordle 状态')
         return f'https://discord.com/channels/{game["guild"]}/{game["channel"]}/{mid}'
 
-    async def run(self,guild,channel,user,name,action,value,request,admin=False,expected=None):
+    async def run(self,guild,channel,user,name,action,value,request,admin=False,expected=None,member=None):
         now=time.monotonic()
         recent=self.requests[(guild,user)]
         while recent and now-recent[0]>=10:
@@ -201,6 +230,8 @@ class WordleService:
                     game=self.db.latest(guild,channel.id)
                     if not game:
                         raise ValueError('本频道还没有 Wordle；用 /鲸鱼 wordle 开始 开一局。')
+                if self.can_attach(channel):
+                    await self.capture_avatars(channel,game,member)
                 created=not game['message']
                 link=await self.update(channel,game)
                 state={'playing':'继续一起猜吧。','won':'全频道猜中啦！','lost':'机会用完啦，答案已揭晓。','stopped':'本局已结束。'}[game['state']]
@@ -219,7 +250,7 @@ class WordleService:
         user=interaction.user
         admin=user.id==int(self.bot.c['owner_id']) or user.guild_permissions.manage_guild
         text,_=await self.run(interaction.guild_id,interaction.channel,user.id,user.display_name,
-                              action,value,interaction.id,admin,expected)
+                              action,value,interaction.id,admin,expected,member=user)
         await interaction.followup.send(text,ephemeral=True,allowed_mentions=discord.AllowedMentions.none())
 
     async def text(self,message,command,expected=None):
@@ -229,7 +260,7 @@ class WordleService:
         action=parts[0] if parts else '帮助'
         value=parts[1] if len(parts)>1 else ''
         text,created=await self.run(message.guild.id,message.channel,message.author.id,
-            message.author.display_name,action,value,message.id,self.bot.admin(message),expected)
+            message.author.display_name,action,value,message.id,self.bot.admin(message),expected,member=message.author)
         if not created:
             sent=await self.bot.send(message,text)
             self.bot.local.db.remember_reply(getattr(sent,'id',None),message.guild.id,message.channel.id,'wordle 状态')

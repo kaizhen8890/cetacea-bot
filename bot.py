@@ -401,7 +401,7 @@ class Whale(discord.Client):
                 await self.deliver_reminders()
                 if time.time()>=prune_at:
                     self.local.db.prune()
-                    self.wordle.db.prune()
+                    await self.wordle.prune()
                     prune_at=time.time()+3600
             except asyncio.CancelledError:
                 raise

@@ -1,10 +1,12 @@
 import asyncio
 import io
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock,patch
+from unittest.mock import AsyncMock,Mock,patch
 import discord
 from PIL import Image
 from bot import Whale
@@ -12,6 +14,20 @@ from storage import Store
 from test_bot import config,message
 from wordle import WordleStore,score,vocabulary,board_text,render_board
 from wordle_discord import WordleView,GuessModal
+from wordle_avatars import AvatarCache,normalize_avatar
+
+
+def avatar_png(color='#ff4433',size=(64,64)):
+    buffer=io.BytesIO()
+    Image.new('RGBA',size,color).save(buffer,format='PNG')
+    return buffer.getvalue()
+
+
+def avatar_member(user=4,color='#ff4433',url='https://cdn.discordapp.com/avatars/4/avatar.png?size=64'):
+    asset=SimpleNamespace(url=url,read=AsyncMock(return_value=avatar_png(color)))
+    asset.replace=Mock(return_value=asset)
+    return SimpleNamespace(id=user,display_name='群友',display_avatar=asset,bot=False,
+                           guild_permissions=SimpleNamespace(manage_guild=False))
 
 
 class WordleRulesTests(unittest.TestCase):
@@ -137,7 +153,8 @@ class WordleStoreTests(unittest.TestCase):
             with patch('wordle.random.choice',return_value='balloon'):
                 game=db.start(1,2,3,'超级')
             db.message(game['id'],900)
-            db.guess(1,2,4,'乙','cartoon','request')
+            game=db.guess(1,2,4,'乙','cartoon','request')
+            db.avatar(game['guesses'][0]['id'],1,2,'a'*64)
             store.close()
             store=Store(path)
             try:
@@ -145,11 +162,59 @@ class WordleStoreTests(unittest.TestCase):
                 game=db.latest(1,2)
                 self.assertEqual(game['message'],'900')
                 self.assertEqual(len(game['guesses']),1)
+                self.assertEqual(game['guesses'][0]['avatar'],'a'*64)
                 self.assertEqual(db.board_round(900,1,2),game['id'])
                 self.assertIsNone(db.board_round(900,5,2))
                 self.assertEqual(len(db.active_boards()),1)
             finally:
                 store.close()
+
+    def test_legacy_schema_migration_keeps_existing_guesses(self):
+        self.start()
+        self.db.guess(1,2,4,'乙','cartoon','request',now=20)
+        with self.store.db:
+            self.store.db.execute('ALTER TABLE wordle_guesses DROP COLUMN avatar')
+        migrated=WordleStore(self.store)
+        migrated=WordleStore(self.store)  # Repeated startup must be harmless.
+        guess=migrated.latest(1,2)['guesses'][0]
+        self.assertEqual(guess['word'],'cartoon')
+        self.assertIsNone(guess['avatar'])
+
+    def test_avatar_snapshot_is_scoped_and_never_replaced(self):
+        self.start()
+        game=self.db.guess(1,2,4,'乙','cartoon','request',now=20)
+        rid=game['guesses'][0]['id']
+        self.db.avatar(rid,5,2,'a'*64)
+        self.assertIsNone(self.db.latest(1,2)['guesses'][0]['avatar'])
+        self.db.avatar(rid,1,2,'a'*64)
+        self.db.avatar(rid,1,2,'b'*64)
+        self.assertEqual(self.db.latest(1,2)['guesses'][0]['avatar'],'a'*64)
+        with self.assertRaises(ValueError):
+            self.db.avatar(rid,1,2,'../avatar')
+
+    def test_avatars_are_circular_and_each_guess_uses_its_own_snapshot(self):
+        for mode in ('普通','超级'):
+            channel=5 if mode=='普通' else 7
+            self.start(mode,channel=channel)
+            self.db.guess(1,channel,4,'甲','slate' if mode=='普通' else 'balance',1,now=20)
+            game=self.db.guess(1,channel,5,'乙','adieu' if mode=='普通' else 'cartoon',2,now=21)
+            for guess,key in zip(game['guesses'],('a'*64,'b'*64)):
+                guess['avatar']=key
+            data=render_board(game,{'a'*64:avatar_png('#ff0000'),'b'*64:avatar_png('#0000ff')})
+            with Image.open(io.BytesIO(data)) as im:
+                center_x,center_y,stride=(54,143,89) if mode=='普通' else (50,135,73)
+                self.assertEqual(im.getpixel((center_x,center_y)),(255,0,0))
+                self.assertEqual(im.getpixel((center_x,center_y+stride)),(0,0,255))
+                self.assertNotEqual(im.getpixel((28,center_y-(26 if mode=='普通' else 22))),(255,0,0))
+
+    def test_missing_or_corrupt_avatar_does_not_break_board(self):
+        self.start()
+        game=self.db.guess(1,2,4,'群友','balance',1,now=20)
+        game['guesses'][0]['avatar']='a'*64
+        for avatars in ({},{'a'*64:b'broken PNG'}):
+            with Image.open(io.BytesIO(render_board(game,avatars))) as im:
+                self.assertEqual(im.size,(560,1170))
+                self.assertEqual(im.getpixel((112,115)),(32,134,108))
 
     def test_png_dimensions_colors_and_file_size(self):
         for mode in ('普通','超级'):
@@ -166,6 +231,79 @@ class WordleStoreTests(unittest.TestCase):
                     self.assertEqual(im.getpixel((112,115)),(32,134,108))
             self.assertLess(len(png),300_000)
 
+
+class WordleAvatarCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.directory=tempfile.TemporaryDirectory()
+        self.folder=Path(self.directory.name)/'avatars'
+        self.cache=AvatarCache(self.folder)
+
+    async def asyncTearDown(self):
+        self.directory.cleanup()
+
+    async def test_concurrent_snapshots_share_one_download_and_survive_restart(self):
+        member=avatar_member()
+        keys=await asyncio.gather(*(self.cache.snapshot(member) for _ in range(4)))
+        self.assertEqual(len(set(keys)),1)
+        member.display_avatar.read.assert_awaited_once()
+        member.display_avatar.replace.assert_called_with(size=64,format='png',static_format='png')
+        restored=AvatarCache(self.folder)
+        self.assertEqual(await restored.snapshot(member),keys[0])
+        member.display_avatar.read.assert_awaited_once()
+        game={'guesses':[{'avatar':keys[0]}]}
+        with Image.open(io.BytesIO(restored.images(game)[keys[0]])) as im:
+            self.assertEqual(im.size,(96,96))
+
+    async def test_failed_download_has_backoff_and_is_optional(self):
+        member=avatar_member()
+        member.display_avatar.read.side_effect=OSError('offline')
+        self.assertIsNone(await self.cache.snapshot(member))
+        self.assertIsNone(await self.cache.snapshot(member))
+        member.display_avatar.read.assert_awaited_once()
+        self.assertIsNone(await self.cache.snapshot(SimpleNamespace(id=4)))
+
+    async def test_slow_download_times_out_without_blocking_next_operation(self):
+        member=avatar_member()
+        async def blocked():
+            await asyncio.Event().wait()
+        member.display_avatar.read.side_effect=blocked
+        started=time.monotonic()
+        self.assertIsNone(await self.cache.snapshot(member))
+        self.assertLess(time.monotonic()-started,4)
+        self.assertFalse(self.cache.pending)
+
+    async def test_avatar_change_uses_new_file_but_keeps_old_snapshot(self):
+        first=await self.cache.snapshot(avatar_member())
+        second=await self.cache.snapshot(avatar_member(color='#0000ff',url='https://cdn.discordapp.com/avatars/4/new.png'))
+        self.assertNotEqual(first,second)
+        self.assertTrue((self.folder/(first+'.png')).exists())
+        self.assertTrue((self.folder/(second+'.png')).exists())
+
+    async def test_corrupt_disk_cache_can_be_repaired_and_bad_keys_are_ignored(self):
+        member=avatar_member()
+        key=await self.cache.snapshot(member)
+        (self.folder/(key+'.png')).write_bytes(b'broken PNG')
+        restored=AvatarCache(self.folder)
+        self.assertEqual(restored.images({'guesses':[{'avatar':'../outside'},{'avatar':key}]}),{})
+        self.assertEqual(await restored.snapshot(member),key)
+        self.assertEqual(member.display_avatar.read.await_count,2)
+
+    async def test_pruning_preserves_referenced_or_recent_avatars(self):
+        key=await self.cache.snapshot(avatar_member())
+        for other in ('b'*64,'c'*64):
+            (self.folder/(other+'.png')).write_bytes(avatar_png())
+        old=time.time()-31*86400
+        os.utime(self.folder/(key+'.png'),(old,old))
+        os.utime(self.folder/('b'*64+'.png'),(old,old))
+        self.cache.prune({key})
+        self.assertTrue((self.folder/(key+'.png')).exists())
+        self.assertFalse((self.folder/('b'*64+'.png')).exists())
+        self.assertTrue((self.folder/('c'*64+'.png')).exists())
+
+    async def test_oversized_or_invalid_image_is_rejected(self):
+        for data in (b'broken PNG',b'x'*1_000_001,avatar_png(size=(513,64))):
+            with self.assertRaises((ValueError,OSError)):
+                normalize_avatar(data)
 
 class WordleDiscordTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -208,6 +346,49 @@ class WordleDiscordTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.wordle.db.latest(1,2)['message'],'900')
         self.bot.llm.chat.assert_not_awaited()
         self.assertEqual(self.store.usage()['calls'],0)
+
+    async def test_slash_guess_saves_avatar_and_invalid_word_does_not_download(self):
+        interaction=self.interaction()
+        interaction.user=avatar_member()
+        with patch.object(self.bot.wordle,'can_attach',return_value=True):
+            await self.start()
+            await self.bot.wordle.interact(interaction,'猜','invalid!')
+            interaction.user.display_avatar.read.assert_not_awaited()
+            await self.bot.wordle.interact(interaction,'猜','cartoon')
+            key=self.bot.wordle.db.latest(1,2)['guesses'][0]['avatar']
+            self.assertIsNotNone(key)
+            await self.bot.wordle.interact(interaction,'状态')
+        interaction.user.display_avatar.read.assert_awaited_once()
+        self.bot.llm.chat.assert_not_awaited()
+
+    async def test_avatar_failure_does_not_lose_guess_or_png(self):
+        interaction=self.interaction()
+        interaction.user=avatar_member()
+        interaction.user.display_avatar.read.side_effect=OSError('offline')
+        with patch.object(self.bot.wordle,'can_attach',return_value=True):
+            await self.start()
+            await self.bot.wordle.interact(interaction,'猜','cartoon')
+        guess=self.bot.wordle.db.latest(1,2)['guesses'][0]
+        self.assertEqual(guess['word'],'cartoon')
+        self.assertIsNone(guess['avatar'])
+        self.assertTrue(self.edit.call_args.kwargs['attachments'][0].filename.endswith('.png'))
+
+    async def test_prefix_guess_passes_member_and_legacy_rows_use_cached_members(self):
+        with patch.object(self.bot.wordle,'can_attach',return_value=True):
+            await self.start()
+            m=message(777,'!鲸鱼 wordle 猜 cartoon',uid=4)
+            m.channel=self.channel
+            m.author=avatar_member()
+            await self.bot.on_message(m)
+            self.assertIsNotNone(self.bot.wordle.db.latest(1,2)['guesses'][0]['avatar'])
+            self.bot.wordle.db.guess(1,2,5,'乙','balance','legacy')
+            second=avatar_member(user=5,color='#0000ff',url='https://cdn.discordapp.com/avatars/5/avatar.png')
+            self.channel.guild.get_member=lambda uid:second if uid==5 else None
+            await self.bot.wordle.interact(self.interaction(),'状态')
+        guesses=self.bot.wordle.db.latest(1,2)['guesses']
+        self.assertTrue(all(g['avatar'] for g in guesses))
+        self.assertNotEqual(guesses[0]['avatar'],guesses[1]['avatar'])
+        self.bot.llm.chat.assert_not_awaited()
 
     async def test_no_attachment_permission_uses_text_and_keeps_progress(self):
         await self.start()
