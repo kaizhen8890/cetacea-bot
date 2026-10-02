@@ -38,6 +38,8 @@
   "explanation_max_output_tokens": 500,
   "long_output_tokens": 2048,
   "long_auto_continue": 1,
+  "wordle_ai_max_tokens": 4096,
+  "wordle_ai_extra_body": {"thinking": {"type": "enabled"}, "reasoning_effort": "low"},
   "max_prompt_bytes": 7000,
   "reply_delay_seconds": 2.0,
   "reply_batch_max_wait_seconds": 12.0,

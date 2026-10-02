@@ -71,7 +71,7 @@ class LocalPollView(discord.ui.View):
 
 
 def command_group(bot):
-    group=discord.app_commands.Group(name='鲸鱼',description='本地工具与鲸鱼互动，不消耗大模型 token',guild_only=True)
+    group=discord.app_commands.Group(name='鲸鱼',description='本地工具与鲸鱼互动；Wordle AI 代玩消耗模型额度',guild_only=True)
 
     @group.command(name='工具',description='查看本地工具用法')
     async def tools(interaction:discord.Interaction):

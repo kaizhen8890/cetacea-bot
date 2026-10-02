@@ -3,7 +3,7 @@ import math
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-from provider import provider_settings,local_api
+from provider import provider_settings,local_api,validate_extra_body
 from local_tools import configured_features
 
 ROOT = Path(__file__).resolve().parent
@@ -51,6 +51,11 @@ def load_settings(require_discord=False):
     c.setdefault('reply_batch_max_messages',32)
     c.setdefault('long_output_tokens',2048)
     c.setdefault('long_auto_continue',1)
+    c.setdefault('wordle_ai_max_tokens',4096)
+    c.setdefault('wordle_ai_extra_body',{'thinking':{'type':'enabled'},'reasoning_effort':'low'})
+    validate_extra_body(c['wordle_ai_extra_body'])
+    if type(c['wordle_ai_max_tokens']) is not int or not 256<=c['wordle_ai_max_tokens']<=8192:
+        raise ValueError('Wordle AI 输出额度须为256—8192 tokens（含思考）。')
     for name in ('daily_budget_rmb',
                  'usd_to_rmb', 'cost_margin', 'api_timeout_seconds',
                  'reply_delay_seconds','reply_batch_max_wait_seconds'):

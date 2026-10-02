@@ -100,6 +100,7 @@ class Whale(discord.Client):
             task.cancel()
         if self.workers:
             await asyncio.gather(*self.workers.values(),return_exceptions=True)
+        await self.wordle.player.close()
         await self.long_answers.close()
         if self.session:
             await self.session.close()

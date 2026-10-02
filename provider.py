@@ -82,10 +82,13 @@ def api_headers(c):
     return {'Authorization':'Bearer '+c['api_key']} if c.get('api_key') else {}
 
 
-def chat_payload(c,messages,max_tokens):
+def chat_payload(c,messages,max_tokens,extra_body=None):
     payload={'model':c['model'],'messages':messages,'max_tokens':max_tokens,
              'temperature':0.8,'stream':False}
-    for key,value in validate_extra_body(c.get('api_extra_body',default_extra_body(c['api_base']))).items():
+    parameters=dict(validate_extra_body(c.get('api_extra_body',default_extra_body(c['api_base']))))
+    if extra_body is not None:
+        parameters.update(validate_extra_body(extra_body))
+    for key,value in parameters.items():
         if value is None:
             payload.pop(key,None)
         else:

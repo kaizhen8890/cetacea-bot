@@ -518,7 +518,7 @@ class WordleDiscordTests(unittest.IsolatedAsyncioTestCase):
         group=self.bot.tree.get_commands()[0]
         self.assertEqual(len(group.commands),25)
         wordle=group.get_command('wordle')
-        self.assertEqual({cmd.name for cmd in wordle.commands},{'开始','猜','状态','结束','规则'})
+        self.assertEqual({cmd.name for cmd in wordle.commands},{'开始','猜','状态','结束','规则','自己玩','停止代玩'})
         self.assertEqual([choice.value for choice in wordle.get_command('开始').parameters[0].choices],['普通','超级'])
         await wordle.get_command('规则').callback(self.interaction())
         self.bot.llm.chat.assert_not_awaited()

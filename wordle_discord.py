@@ -1,4 +1,4 @@
-"""Discord UI for offline Wordle. All requests stay outside the chat pipeline."""
+"""Discord UI for Wordle; only explicit AI play commands call a model."""
 import asyncio
 import hashlib
 import io
@@ -10,6 +10,7 @@ import discord
 from engine import safe_text
 from wordle import WordleStore,RULES,board_text,render_board
 from wordle_avatars import AvatarCache
+from wordle_player import WordlePlayer
 
 LOG=logging.getLogger('cetacea')
 
@@ -82,6 +83,7 @@ class WordleService:
         self.avatars=AvatarCache(Path(database).parent/'wordle-avatars' if database else None)
         self.locks=defaultdict(asyncio.Lock)
         self.requests=defaultdict(deque)
+        self.player=WordlePlayer(self)
 
     def restore(self):
         self.db.prune()
@@ -201,6 +203,11 @@ class WordleService:
         return f'https://discord.com/channels/{game["guild"]}/{game["channel"]}/{mid}'
 
     async def run(self,guild,channel,user,name,action,value,request,admin=False,expected=None,member=None):
+        if action=='停止代玩':
+            try:
+                return self.player.stop(guild,channel.id,user,admin),False
+            except ValueError as exc:
+                return str(exc),False
         now=time.monotonic()
         recent=self.requests[(guild,user)]
         while recent and now-recent[0]>=10:
@@ -210,8 +217,24 @@ class WordleService:
         recent.append(now)
         if action in ('规则','帮助'):
             return RULES,False
+        if action in ('自己玩','代玩','猜一步'):
+            try:
+                parts=value.split()
+                mode=parts[0] if parts and parts[0] in ('当前','普通','超级') else '当前'
+                if parts and parts[0]==mode:
+                    parts.pop(0)
+                scope=parts.pop(0) if parts else ('一步' if action=='猜一步' else '整局')
+                if parts:
+                    raise ValueError('用法：wordle 自己玩 [当前/普通/超级] [整局/一步]。')
+                if expected is not None:
+                    game=self.db.latest(guild,channel.id)
+                    if not game or game['id']!=expected:
+                        raise ValueError('这是旧棋盘，请使用最新一局。')
+                return await self.player.start(guild,channel,user,mode,scope,request),False
+            except (ValueError,discord.HTTPException) as exc:
+                return str(exc) if isinstance(exc,ValueError) else '棋盘暂时无法同步，尚未开始代玩；用 wordle 状态 重试。',False
         if action not in ('开始','猜','状态','结束'):
-            return '用法：wordle 开始 普通/超级 · wordle 猜 单词 · wordle 状态 · wordle 结束。',False
+            return '用法：wordle 开始 普通/超级 · wordle 猜 单词 · wordle 状态 · wordle 结束 · wordle 自己玩 · wordle 停止代玩。',False
         if action in ('开始','猜') and not self.bot.local.enabled(guild,'wordle'):
             return '本服务器的 Wordle 已关闭。',False
         async with self.locks[(guild,channel.id)]:
@@ -226,6 +249,7 @@ class WordleService:
                     game=self.db.guess(guild,channel.id,user,safe_text(name),value,request,expected)
                 elif action=='结束':
                     game=self.db.stop(guild,channel.id,user,admin)
+                    self.player.halt(guild,channel.id)
                 else:
                     game=self.db.latest(guild,channel.id)
                     if not game:
@@ -235,6 +259,8 @@ class WordleService:
                 created=not game['message']
                 link=await self.update(channel,game)
                 state={'playing':'继续一起猜吧。','won':'全频道猜中啦！','lost':'机会用完啦，答案已揭晓。','stopped':'本局已结束。'}[game['state']]
+                if (guild,channel.id) in self.player.sessions:
+                    state+='鲸鱼娘正在代玩，群友仍可参与。'
                 return f'🐳 已用 {len(game["guesses"])}/{game["max_tries"]} 次，{state} [查看棋盘]({link})',created
             except ValueError as exc:
                 return str(exc),False
@@ -267,7 +293,7 @@ class WordleService:
 
 
 def add_commands(parent,bot):
-    group=discord.app_commands.Group(name='wordle',description='全频道合作猜英文单词，本地图片棋盘',parent=parent)
+    group=discord.app_commands.Group(name='wordle',description='合作猜词与图片棋盘；可让鲸鱼娘用 AI 代玩',parent=parent)
 
     @group.command(name='开始',description='开一局；普通 5 字母/6 次，超级 7 字母/12 次')
     @discord.app_commands.choices(模式=[discord.app_commands.Choice(name='普通 · 5 字母 / 6 次',value='普通'),
@@ -290,3 +316,17 @@ def add_commands(parent,bot):
     @group.command(name='规则',description='查看合作 Wordle 规则')
     async def rules(interaction:discord.Interaction):
         await bot.wordle.interact(interaction,'规则')
+
+    @group.command(name='自己玩',description='鲸鱼娘用 thinking low 猜词，消耗每日 API 额度')
+    @discord.app_commands.choices(
+        模式=[discord.app_commands.Choice(name='沿用当前局；没有进行中的局就开普通',value='当前'),
+              discord.app_commands.Choice(name='普通 · 5 字母 / 6 次',value='普通'),
+              discord.app_commands.Choice(name='超级 · 7 字母 / 12 次',value='超级')],
+        范围=[discord.app_commands.Choice(name='整局自动猜',value='整局'),
+              discord.app_commands.Choice(name='只猜一步',value='一步')])
+    async def play(interaction:discord.Interaction,模式:str='当前',范围:str='整局'):
+        await bot.wordle.interact(interaction,'自己玩',模式+' '+范围)
+
+    @group.command(name='停止代玩',description='停止鲸鱼娘猜词，保留棋盘让群友继续')
+    async def stop_play(interaction:discord.Interaction):
+        await bot.wordle.interact(interaction,'停止代玩')

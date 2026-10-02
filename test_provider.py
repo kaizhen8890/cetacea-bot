@@ -12,7 +12,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 import check
 import settings
-from engine import LLM,cost_rmb
+from engine import LLM,cost_rmb,APIError
 from provider import normalize_api_base,provider_settings,chat_payload,fetch_model_ids
 from setup_gui import provider_form_settings
 from storage import Store,BudgetExceeded
@@ -63,6 +63,17 @@ class ProviderSettingsTests(unittest.TestCase):
         for key in ('model','messages','stream','max_tokens','max_completion_tokens'):
             with self.subTest(key=key),self.assertRaises(ValueError):
                 provider_settings(dict(c,api_extra_body={key:None}))
+
+    def test_per_request_thinking_does_not_modify_chat_defaults(self):
+        c=provider_settings(dict(config(),api_extra_body={'thinking':{'type':'disabled'},'temperature':0.6}))
+        override={'thinking':{'type':'enabled'},'reasoning_effort':'low'}
+        payload=chat_payload(c,[],2048,extra_body=override)
+        self.assertEqual(payload['thinking'],{'type':'enabled'})
+        self.assertEqual(payload['reasoning_effort'],'low')
+        self.assertEqual(payload['temperature'],0.6)
+        self.assertEqual(chat_payload(c,[],80)['thinking'],{'type':'disabled'})
+        self.assertNotIn('reasoning_effort',chat_payload(c,[],80))
+        self.assertEqual(override,{'thinking':{'type':'enabled'},'reasoning_effort':'low'})
 
     def test_prices_and_extra_json_are_validated(self):
         for changes in ({'input_price_per_million':-1},{'output_price_per_million':float('nan')},
@@ -118,10 +129,11 @@ class ProviderIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.received=[]
         self.headers=[]
         self.model_reads=0
+        self.response=None
         async def chat(request):
             self.received.append(await request.json())
             self.headers.append(dict(request.headers))
-            return web.json_response({'choices':[{'message':{'content':'鲸鱼娘来了'}}],
+            return web.json_response(self.response or {'choices':[{'message':{'content':'鲸鱼娘来了'}}],
                                       'usage':{'prompt_tokens':10,'completion_tokens':5}})
         async def models(request):
             self.model_reads+=1
@@ -162,6 +174,34 @@ class ProviderIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BudgetExceeded):
             await llm.chat([{'role':'user','content':'再来'}])
         self.assertEqual(len(self.received),1)
+
+    async def test_thinking_is_scoped_to_ai_call_and_accounted_for(self):
+        llm=LLM(dict(self.c,api_extra_body={'thinking':{'type':'disabled'}}),self.store,self.session)
+        await llm.chat([{'role':'user','content':'guess a word'}],'wordle_ai',max_tokens=2048,
+            extra_body={'thinking':{'type':'enabled'},'reasoning_effort':'low'})
+        await llm.chat([{'role':'user','content':'hello'}])
+        self.assertEqual(self.received[0]['reasoning_effort'],'low')
+        self.assertEqual(self.received[0]['thinking'],{'type':'enabled'})
+        self.assertEqual(self.received[1]['thinking'],{'type':'disabled'})
+        self.assertNotIn('reasoning_effort',self.received[1])
+        row=self.store.db.execute("SELECT * FROM calls WHERE kind='wordle_ai'").fetchone()
+        self.assertEqual(row['output_tokens'],5)
+        self.assertGreater(row['charged'],0)
+
+    async def test_invalid_request_override_cannot_spend_budget_or_replace_messages(self):
+        with self.assertRaises(ValueError):
+            await LLM(self.c,self.store,self.session).chat([],extra_body={'messages':[]})
+        self.assertEqual(self.store.usage()['calls'],0)
+        self.assertEqual(self.received,[])
+
+    async def test_reasoning_only_response_keeps_its_fee_without_automatic_retry(self):
+        self.response={'choices':[{'message':{'content':'','reasoning_content':'test-only reasoning'},'finish_reason':'length'}],
+                       'usage':{'prompt_tokens':10,'completion_tokens':2000}}
+        with self.assertRaisesRegex(APIError,'只返回了思考内容'):
+            await LLM(self.c,self.store,self.session).chat([{'role':'user','content':'guess'}],'wordle_ai',max_tokens=2048,
+                extra_body={'thinking':{'type':'enabled'},'reasoning_effort':'low'})
+        self.assertEqual(len(self.received),1)
+        self.assertAlmostEqual(self.store.usage()['cost'],cost_rmb(self.c,10,2000))
 
     async def test_optional_catalogue_can_be_absent_and_never_follows_redirects(self):
         with self.assertRaisesRegex(ValueError,'不提供模型列表'):

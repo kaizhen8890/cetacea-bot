@@ -322,7 +322,7 @@ class LLM:
         self.blocked_until=0.0
         self.failures=0
 
-    async def chat(self,messages,kind='mention',max_tokens=None,is_current=None):
+    async def chat(self,messages,kind='mention',max_tokens=None,is_current=None,extra_body=None):
         async with self.lock:
             if is_current is not None and not is_current():
                 raise MessageChanged()
@@ -335,11 +335,12 @@ class LLM:
             bound=prompt_bytes(messages)
             if bound>c['max_prompt_bytes']:
                 raise APIError('本次上下文超过节省模式限制。')
+            payload=chat_payload(c,messages,max_tokens,extra_body=extra_body)
             call_id=self.store.reserve(cost_rmb(c,bound,max_tokens),kind,c)
             try:
                 async with self.session.post(c['api_base'].rstrip('/')+'/chat/completions',
                     headers=api_headers(c),
-                    json=chat_payload(c,messages,max_tokens),
+                    json=payload,
                     timeout=aiohttp.ClientTimeout(total=c['api_timeout_seconds']),
                     allow_redirects=False) as response:
                     if response.status!=200:
@@ -355,6 +356,8 @@ class LLM:
                 choice=data['choices'][0]
                 content=choice['message'].get('content')
                 if not isinstance(content,str) or not content.strip():
+                    if choice['message'].get('reasoning_content'):
+                        raise APIError('模型只返回了思考内容，没有最终答案；请提高该功能的输出额度，或检查接口的思考设置。本次不自动重试。')
                     raise APIError('模型没有返回可显示的文字，本次不自动重试。')
                 content=re.sub(r'<think>.*?</think>','',content,flags=re.S).strip()
                 if '<think>' in content:
