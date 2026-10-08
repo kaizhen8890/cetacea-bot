@@ -123,6 +123,36 @@ class ProviderSettingsTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError,'密钥'):
                     settings.load_settings()
 
+    def test_teaching_profile_settings_and_invalid_overrides(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            c=dict(config(),api_base='http://127.0.0.1:1234/v1',teaching_max_tokens=4096,teaching_timeout_seconds=120)
+            root.joinpath('persona.txt').write_text('鲸鱼娘',encoding='utf-8')
+            with patch.object(settings,'ROOT',root),patch.dict(os.environ,{},clear=True):
+                root.joinpath('config.json').write_text(json.dumps(c),encoding='utf-8')
+                loaded=settings.load_settings()
+                self.assertEqual(loaded['teaching_max_tokens'],4096)
+                self.assertEqual(loaded['teaching_timeout_seconds'],120)
+                self.assertEqual(loaded['teaching_extra_body'],{'thinking':{'type':'enabled'},'reasoning_effort':'high'})
+                for change in ({'teaching_max_tokens':8193},{'teaching_max_tokens':True},
+                               {'teaching_timeout_seconds':0},{'teaching_timeout_seconds':float('nan')},
+                               {'teaching_extra_body':{'model':'unsafe-override'}}):
+                    with self.subTest(change=change):
+                        root.joinpath('config.json').write_text(json.dumps(dict(c,**change)),encoding='utf-8')
+                        with self.assertRaises(ValueError):
+                            settings.load_settings()
+
+    def test_gui_saves_separate_teaching_budget_and_timeout(self):
+        values={'api_base':'https://new.example/v1','api_key':'test-only','model':'test-model',
+                'pricing_currency':'CNY','input_price_per_million':'1','output_price_per_million':'2',
+                'usd_to_rmb':'7','daily_budget_rmb':'2','teaching_max_tokens':'4096','teaching_timeout_seconds':'120'}
+        c=provider_form_settings(config(),values,'{}')
+        self.assertEqual(c['teaching_max_tokens'],4096)
+        self.assertEqual(c['teaching_timeout_seconds'],120)
+        for change in ({'teaching_max_tokens':'8193'},{'teaching_timeout_seconds':'NaN'}):
+            with self.subTest(change=change),self.assertRaises(ValueError):
+                provider_form_settings(c,dict(values,**change),'{}')
+
 
 class ProviderIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

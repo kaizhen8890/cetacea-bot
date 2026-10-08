@@ -7,7 +7,7 @@ import logging
 import sqlite3
 from types import SimpleNamespace
 import discord
-from engine import APIError,MessageChanged,clip,prompt_bytes,safe_text
+from engine import APIError,MessageChanged,clip,prompt_bytes,safe_text,teaching_options
 from storage import BudgetExceeded
 from memory import record as record_memory
 from long_answers import AnswerStore,split_text
@@ -111,16 +111,17 @@ class LongAnswers:
         if not self.fresh(task):
             return None
         async with m.channel.typing():
+            options=teaching_options(self.bot.c) if task['teaching'] else {'max_tokens':self.bot.c.get('long_output_tokens',2048)}
             result=await self.bot.llm.chat(self.continuation_messages(m,task),'mention',
-                max_tokens=self.bot.c.get('long_output_tokens',2048),is_current=is_current)
+                is_current=is_current,**options)
         task=self.fresh(task)
         if not task or self.bot.store.pref(f'paused:{m.channel.id}')=='1':
             return None
         return self.storage(task).append(task,str(result),not getattr(result,'truncated',False))
 
-    async def begin(self,m,prompt,result,ids,auto=True,is_current=None):
+    async def begin(self,m,prompt,result,ids,auto=True,is_current=None,teaching=False):
         store=self.disk if self.bot.memory_on(m) else self.volatile
-        task=store.create(m.guild.id,m.channel.id,m.author.id,safe_text(prompt),ids)
+        task=store.create(m.guild.id,m.channel.id,m.author.id,safe_text(prompt),ids,teaching=teaching)
         task=store.append(task,str(result),not getattr(result,'truncated',False))
         if auto and not task['finished'] and self.bot.c.get('long_auto_continue',1):
             try:

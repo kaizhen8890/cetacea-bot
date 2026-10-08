@@ -51,6 +51,15 @@ def load_settings(require_discord=False):
     c.setdefault('reply_batch_max_messages',32)
     c.setdefault('long_output_tokens',2048)
     c.setdefault('long_auto_continue',1)
+    c.setdefault('teaching_max_tokens',8192)
+    c.setdefault('teaching_timeout_seconds',90)
+    c.setdefault('teaching_extra_body',{'thinking':{'type':'enabled'},'reasoning_effort':'high'})
+    validate_extra_body(c['teaching_extra_body'])
+    if type(c['teaching_max_tokens']) is not int or not 512<=c['teaching_max_tokens']<=8192:
+        raise ValueError('教学额度须为512—8192 tokens（含思考和正文）。')
+    if (type(c['teaching_timeout_seconds']) not in (int,float) or not math.isfinite(c['teaching_timeout_seconds'])
+            or not 1<=c['teaching_timeout_seconds']<=300):
+        raise ValueError('教学最长等待须为1—300秒。')
     c.setdefault('wordle_ai_max_tokens',4096)
     c.setdefault('wordle_ai_extra_body',{'thinking':{'type':'enabled'},'reasoning_effort':'low'})
     validate_extra_body(c['wordle_ai_extra_body'])

@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock,patch
 from settings import ROOT,load_settings,configured_servers
 from setup_gui import parse_server_lines,format_server_lines
 from storage import Store,BudgetExceeded,day_key
-from engine import Context,Policy,ConversationTracker,LLM,APIError,MessageChanged,MessageBurst,join_fragments,compact_history,prompt_bytes,explanation_request,choose_emote
+from engine import Context,Policy,ConversationTracker,LLM,APIError,MessageChanged,MessageBurst,join_fragments,compact_history,prompt_bytes,explanation_request,choose_emote,teaching_options
 from bot import Whale
 from memory import save_summary
 
@@ -295,6 +295,34 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(payload['allow_redirects'])
         self.assertEqual(self.s.usage()['calls'],1)
 
+    async def test_teaching_high_thinking_timeout_and_usage_do_not_change_chat(self):
+        session=FakeSession(FakeResponse(data={'usage':{'prompt_tokens':100,'completion_tokens':350,
+            'completion_tokens_details':{'reasoning_tokens':300}},
+            'choices':[{'message':{'content':'教学正文','reasoning_content':'private test reasoning'},'finish_reason':'stop'}]}))
+        llm=LLM(self.c,self.s,session)
+        result=await llm.chat(self.messages,**teaching_options(self.c))
+        self.assertEqual(result,'教学正文')
+        payload=session.calls[0][1]
+        self.assertEqual(payload['json']['thinking'],{'type':'enabled'})
+        self.assertEqual(payload['json']['reasoning_effort'],'high')
+        self.assertEqual(payload['json']['max_tokens'],8192)
+        self.assertEqual(payload['timeout'].total,90)
+        self.assertEqual(self.s.db.execute('SELECT output_tokens FROM calls').fetchone()[0],350)
+        await llm.chat(self.messages)
+        payload=session.calls[1][1]
+        self.assertEqual(payload['json']['thinking'],{'type':'disabled'})
+        self.assertNotIn('reasoning_effort',payload['json'])
+        self.assertEqual(payload['json']['max_tokens'],80)
+        self.assertEqual(payload['timeout'].total,self.c['api_timeout_seconds'])
+
+    async def test_invalid_timeout_does_not_make_paid_request(self):
+        session=FakeSession(FakeResponse())
+        for value in (0,301,True,float('nan')):
+            with self.subTest(value=value),self.assertRaises(APIError):
+                await LLM(self.c,self.s,session).chat(self.messages,timeout_seconds=value)
+        self.assertEqual(self.s.usage()['calls'],0)
+        self.assertEqual(session.calls,[])
+
     async def test_explanation_can_use_longer_output_limit(self):
         session=FakeSession(FakeResponse(data={'usage':{'prompt_tokens':10,'completion_tokens':5},
             'choices':[{'message':{'content':'认真解释'},'finish_reason':'stop'}]}))
@@ -528,7 +556,7 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
         self.bot.llm.chat.assert_awaited_once()
         payload=json.loads(self.bot.llm.chat.call_args.args[0][-1]['content'])
         self.assertIn('电磁感应是什么原理呢',payload['当前发言'])
-        self.assertEqual(self.bot.llm.chat.call_args.kwargs['max_tokens'],2048)
+        self.assertEqual(self.bot.llm.chat.call_args.kwargs['max_tokens'],8192)
         first.channel.send.assert_awaited_once()
 
     async def test_fragments_arriving_during_history_use_only_one_cloud_call(self):
@@ -736,7 +764,7 @@ class DiscordFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('电磁感应',str(messages))
         self.assertIn('正在回复的消息',messages[-1]['content'])
         self.assertIn('上一级引用',messages[-1]['content'])
-        self.assertEqual(self.bot.llm.chat.call_args.kwargs['max_tokens'],2048)
+        self.assertEqual(self.bot.llm.chat.call_args.kwargs['max_tokens'],8192)
         self.assertNotIn('<:saya_ok:123>',current.channel.send.call_args.args[0])
 
     async def test_history_respects_memory_opt_out_and_clear_cutoff(self):

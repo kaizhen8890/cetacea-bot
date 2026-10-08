@@ -120,6 +120,9 @@ class AnswerStore:
                 message TEXT PRIMARY KEY,task INTEGER NOT NULL,author TEXT NOT NULL,kind TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS answer_scope ON answer_tasks(guild,channel,owner,updated);
         ''')
+        if 'teaching' not in {r['name'] for r in db.execute('PRAGMA table_info(answer_tasks)')}:
+            with db:
+                db.execute('ALTER TABLE answer_tasks ADD COLUMN teaching INTEGER NOT NULL DEFAULT 0')
 
     def get(self,tid,guild,channel):
         row=self.db.execute('SELECT * FROM answer_tasks WHERE id=? AND guild=? AND channel=?',
@@ -145,11 +148,11 @@ class AnswerStore:
         with self.db:
             self.db.execute('INSERT OR IGNORE INTO answer_links VALUES(?,?,?,?)',(str(mid),tid,str(author),kind))
 
-    def create(self,guild,channel,user,prompt,ids):
+    def create(self,guild,channel,user,prompt,ids,teaching=False):
         now=time.time()
         with self.db:
-            row=self.db.execute('INSERT INTO answer_tasks(guild,channel,owner,prompt,created,updated) VALUES(?,?,?,?,?,?)',
-                                (str(guild),str(channel),str(user),prompt,now,now))
+            row=self.db.execute('INSERT INTO answer_tasks(guild,channel,owner,prompt,created,updated,teaching) VALUES(?,?,?,?,?,?,?)',
+                                (str(guild),str(channel),str(user),prompt,now,now,int(teaching)))
         for mid in ids:
             self.link(row.lastrowid,mid,user)
         return self.get(row.lastrowid,guild,channel)

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import random
 import re
 import time
@@ -128,6 +129,12 @@ def explanation_request(text):
         r'|(?:这题|这道题|这个句子|这句|这一步|这个答案).{0,30}(?:对吗|正确吗|错了|错在哪|有错吗|怎么|如何)'
         r'|\b(?:explain|teach|meaning|synonym|antonym|define|definition|example)\b'
         r'|\b(?:how\s+(?:do|does|can|to)|what\s+(?:is|are))\b',text,re.I))
+
+
+def teaching_options(c):
+    return {'max_tokens':c.get('teaching_max_tokens',8192),
+            'extra_body':c.get('teaching_extra_body',{'thinking':{'type':'enabled'},'reasoning_effort':'high'}),
+            'timeout_seconds':c.get('teaching_timeout_seconds',90)}
 
 EMOTE_NAMES = ('tang_love', 'saya_ok', 'tang_ku', 'mao_tounaofengbao', 'tang_ha')
 
@@ -322,7 +329,7 @@ class LLM:
         self.blocked_until=0.0
         self.failures=0
 
-    async def chat(self,messages,kind='mention',max_tokens=None,is_current=None,extra_body=None):
+    async def chat(self,messages,kind='mention',max_tokens=None,is_current=None,extra_body=None,timeout_seconds=None):
         async with self.lock:
             if is_current is not None and not is_current():
                 raise MessageChanged()
@@ -335,13 +342,17 @@ class LLM:
             bound=prompt_bytes(messages)
             if bound>c['max_prompt_bytes']:
                 raise APIError('本次上下文超过节省模式限制。')
+            timeout=c['api_timeout_seconds'] if timeout_seconds is None else timeout_seconds
+            if (type(timeout) not in (int,float) or not math.isfinite(timeout) or timeout<=0
+                    or (timeout_seconds is not None and not 1<=timeout<=300)):
+                raise APIError('接口等待时间须为1—300秒。')
             payload=chat_payload(c,messages,max_tokens,extra_body=extra_body)
             call_id=self.store.reserve(cost_rmb(c,bound,max_tokens),kind,c)
             try:
                 async with self.session.post(c['api_base'].rstrip('/')+'/chat/completions',
                     headers=api_headers(c),
                     json=payload,
-                    timeout=aiohttp.ClientTimeout(total=c['api_timeout_seconds']),
+                    timeout=aiohttp.ClientTimeout(total=timeout),
                     allow_redirects=False) as response:
                     if response.status!=200:
                         raise APIError(f'模型接口返回 HTTP {response.status}，本次不自动重试。')

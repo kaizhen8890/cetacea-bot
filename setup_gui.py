@@ -45,10 +45,15 @@ def provider_form_settings(config,values,extra_text):
     try:
         c['long_output_tokens']=int(values.get('long_output_tokens',c.get('long_output_tokens',2048)))
         c['long_auto_continue']=int(values.get('long_auto_continue',c.get('long_auto_continue',1)))
+        c['teaching_max_tokens']=int(values.get('teaching_max_tokens',c.get('teaching_max_tokens',8192)))
+        c['teaching_timeout_seconds']=float(values.get('teaching_timeout_seconds',c.get('teaching_timeout_seconds',90)))
     except (ValueError,TypeError):
-        raise ValueError('长回答额度和自动续写次数请填写整数。') from None
+        raise ValueError('回复额度和自动续写次数请填写整数；等待时间请填写数字。') from None
     if not 256<=c['long_output_tokens']<=8192 or c['long_auto_continue'] not in (0,1):
         raise ValueError('长回答额度须为256—8192 tokens；自动续写次数为0或1。')
+    if (not 512<=c['teaching_max_tokens']<=8192 or not math.isfinite(c['teaching_timeout_seconds'])
+            or not 1<=c['teaching_timeout_seconds']<=300):
+        raise ValueError('教学额度须为512—8192 tokens，最长等待为1—300秒。')
     c.pop('input_usd_per_million',None)
     c.pop('output_usd_per_million',None)
     c.pop('api_key',None)
@@ -222,7 +227,7 @@ def main():
                     variable=auto_memory).pack(anchor='w',pady=(9,0))
     ttk.Label(advanced_tab,text='供应商有特殊要求时，可在这里填写额外的请求参数。通常保持默认即可。',
               wraplength=710).pack(anchor='w',pady=(0,10))
-    extra_box=tk.Text(advanced_tab,height=10,wrap='word')
+    extra_box=tk.Text(advanced_tab,height=8,wrap='word')
     extra_box.pack(fill='x')
     extra_box.insert('1.0',json.dumps(c['api_extra_body'],ensure_ascii=False,indent=2))
     ttk.Label(advanced_tab,text='格式：JSON 对象。普通兼容接口默认 {}；Inferera 默认关闭思考以节省输出。\n'
@@ -233,7 +238,9 @@ def main():
     long_form.pack(fill='x')
     entry(long_form,0,'long_output_tokens','长回答输出额度（tokens）',str(c.get('long_output_tokens',2048)))
     entry(long_form,1,'long_auto_continue','截断后自动续写次数',str(c.get('long_auto_continue',1)),choices=['0','1'])
-    ttk.Label(advanced_tab,text='适用于作文、翻译和讲解；每日预算仍然有效。长文自动分段或附文本文件。',
+    entry(long_form,2,'teaching_max_tokens','教学额度（含思考与正文）',str(c.get('teaching_max_tokens',8192)))
+    entry(long_form,3,'teaching_timeout_seconds','教学最长等待（秒）',str(c.get('teaching_timeout_seconds',90)))
+    ttk.Label(advanced_tab,text='作文/翻译使用长回答额度；教学启用 high 思考并使用教学额度。每日预算仍然有效。',
               foreground='#555555',wraplength=710).pack(anchor='w',pady=7)
     previous_base={'value':c['api_base']}
     def base_changed(*args):

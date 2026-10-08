@@ -13,7 +13,7 @@ import aiohttp
 import discord
 from settings import ROOT, load_settings
 from storage import Store, BudgetExceeded
-from engine import Context, Policy, ConversationTracker, LLM, APIError, MessageChanged, MessageBurst, join_fragments, compact_history, clip, safe_text, explanation_request, choose_emote, EMOTE_NAMES
+from engine import Context, Policy, ConversationTracker, LLM, APIError, MessageChanged, MessageBurst, join_fragments, compact_history, clip, safe_text, explanation_request, choose_emote, EMOTE_NAMES, teaching_options
 from memory import record as record_memory, mark_engaged, retrieve as retrieve_memory, erase_message, erase_user, status as memory_status, next_batch, pending_fold
 from memory_worker import model_ready, resource_ready
 from local_features import LocalFeatures,LocalResult,TOOL_HELP,natural_command,poll_text
@@ -698,6 +698,7 @@ class Whale(discord.Client):
                     auto_memories=(retrieve_memory(self.store.db,m.guild.id,m.channel.id,
                         m.author.id,retrieval_query,limit=3) if self.c['auto_memory_enabled'] and self.memory_on(m) else [])
                     explain=explanation_request(current)
+                    teaching=explain and kind!='casual'
                     longform=(explain or writing_request(current) or (continue_request(current) and reference and
                         writing_request(str(reference)))) and kind!='casual'
                     excluded={x.id for x,_,_ in batch}|quoted_ids
@@ -712,9 +713,10 @@ class Whale(discord.Client):
                         continue
                     try:
                         async with m.channel.typing():
+                            options=teaching_options(self.c) if teaching else {'max_tokens':
+                                self.c.get('long_output_tokens',2048) if longform else self.c['max_output_tokens']}
                             result=await self.llm.chat(messages,kind,
-                                max_tokens=self.c.get('long_output_tokens',2048) if longform else self.c['max_output_tokens'],
-                                is_current=lambda:burst.version==version)
+                                is_current=lambda:burst.version==version,**options)
                     except MessageChanged:
                         burst.restore(batch)
                         continue
@@ -735,7 +737,7 @@ class Whale(discord.Client):
                         if reference:
                             prompt+='\n用户引用的内容：'+str(reference)[:1000]
                         await self.long_answers.begin(m,prompt,result,[x.id for x,_,_ in batch],
-                            auto=bool(longform),is_current=lambda:burst.version==version)
+                            auto=bool(longform),is_current=lambda:burst.version==version,teaching=teaching)
                         if self.c['auto_memory_enabled'] and self.memory_on(m):
                             mark_engaged(self.store.db,[x.id for x,_,_ in batch])
                         continue

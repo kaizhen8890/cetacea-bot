@@ -80,6 +80,25 @@ class SplitTests(unittest.TestCase):
             self.assertIsNone(db.by_message(20,1,2))
             store.close()
 
+    def test_old_cache_migration_and_teaching_flag_survive_restart(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'answers.sqlite3'
+            store=Store(path); db=AnswerStore(store.db)
+            old=db.create(1,2,3,'旧作文',[10])
+            old=db.append(old,'已经写好的正文',False)
+            with store.db:
+                store.db.execute('ALTER TABLE answer_tasks DROP COLUMN teaching')
+            store.close()
+            store=Store(path); db=AnswerStore(store.db)
+            self.assertEqual(db.by_message(10,1,2)['body'],'已经写好的正文')
+            self.assertFalse(db.by_message(10,1,2)['teaching'])
+            teaching=db.create(1,2,3,'讲解问题',[11],teaching=True)
+            store.close()
+            store=Store(path); db=AnswerStore(store.db)
+            self.assertTrue(db.by_message(11,1,2)['teaching'])
+            self.assertFalse(db.by_message(10,1,2)['teaching'])
+            store.close()
+
 
 class LongFlowTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -139,6 +158,7 @@ class LongFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.handle(self.make(10,'<@50> 写一篇rumusan范文给我'))
         self.bot.llm.chat.assert_awaited_once()
         self.assertEqual(self.bot.llm.chat.call_args.kwargs['max_tokens'],2048)
+        self.assertNotIn('extra_body',self.bot.llm.chat.call_args.kwargs)
         system=self.bot.llm.chat.call_args.args[0][0]['content']
         self.assertNotIn('本次是日常聊天',system)
         self.assertIn('外语作文',system)
@@ -177,12 +197,51 @@ class LongFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(next(reversed(payload)),'当前发言')
         self.assertEqual(payload['正在回复的消息']['上一级引用']['发言'],original.content)
         self.assertNotIn('本次是日常聊天',messages[0]['content'])
-        self.assertEqual(self.bot.llm.chat.call_args.kwargs['max_tokens'],2048)
+        self.assertEqual(self.bot.llm.chat.call_args.kwargs['max_tokens'],8192)
+        self.assertEqual(self.bot.llm.chat.call_args.kwargs['extra_body']['reasoning_effort'],'high')
+        self.assertTrue(self.task()['teaching'])
         self.assertIsNotNone(self.task())
         await self.handle(self.make(11,'能举个例子吗'))
         self.assertEqual(self.bot.llm.chat.await_count,2)
-        self.assertEqual(self.bot.llm.chat.call_args.kwargs['max_tokens'],2048)
+        self.assertEqual(self.bot.llm.chat.call_args.kwargs['max_tokens'],8192)
+        self.assertEqual(self.bot.llm.chat.call_args.kwargs['extra_body']['reasoning_effort'],'high')
         self.assertIn('举个例子',self.bot.llm.chat.call_args.args[0][-1]['content'])
+
+    async def test_teaching_auto_and_manual_continuation_keep_high_profile(self):
+        self.bot.llm.chat.side_effect=[ModelReply('第一段教学。',True),ModelReply('第二段教学。',True),ModelReply('教学结论。')]
+        await self.handle(self.make(10,'<@50> 教我电磁感应'))
+        self.assertEqual(self.bot.llm.chat.await_count,2)
+        self.assertTrue(self.task()['teaching'])
+        await self.handle(self.make(11,'继续',reference=101))
+        self.assertEqual(self.bot.llm.chat.await_count,3)
+        for call in self.bot.llm.chat.call_args_list:
+            self.assertEqual(call.kwargs['max_tokens'],8192)
+            self.assertEqual(call.kwargs['extra_body'],{'thinking':{'type':'enabled'},'reasoning_effort':'high'})
+            self.assertEqual(call.kwargs['timeout_seconds'],90)
+        self.assertTrue(self.task()['finished'])
+
+    async def test_pending_teaching_delivery_does_not_call_high_api_again(self):
+        self.channel.permissions_for=lambda member:SimpleNamespace(attach_files=False,view_channel=True)
+        self.bot.llm.chat.return_value=ModelReply('教学正文。\n\n'*2000)
+        await self.handle(self.make(10,'<@50> 讲解一下这件事'))
+        self.assertLess(self.task()['delivered'],len(self.task()['body']))
+        await self.handle(self.make(11,'补发',reference=105))
+        self.bot.llm.chat.assert_awaited_once()
+        self.assertTrue(self.task()['teaching'])
+
+    async def test_teaching_budget_denial_keeps_auto_generated_body(self):
+        self.bot.llm.chat.side_effect=[ModelReply('已有教学正文。',True),BudgetExceeded('额度不足')]
+        await self.handle(self.make(10,'<@50> 解释电磁感应'))
+        self.assertTrue(self.task()['teaching'])
+        self.assertEqual(self.task()['body'],'已有教学正文。')
+        self.assertEqual(self.bot.llm.chat.call_args.kwargs['extra_body']['reasoning_effort'],'high')
+
+    async def test_casual_insert_does_not_enable_paid_teaching_profile(self):
+        with patch.object(self.bot.policy,'eligible',return_value=True):
+            await self.handle(self.make(10,'物理原理好复杂'))
+        self.bot.llm.chat.assert_awaited_once()
+        self.assertEqual(self.bot.llm.chat.call_args.kwargs['max_tokens'],80)
+        self.assertNotIn('extra_body',self.bot.llm.chat.call_args.kwargs)
 
     async def test_truncated_writing_automatically_continues_once_and_manual_resume_inherits_topic(self):
         self.bot.llm.chat.side_effect=[ModelReply('第一段正文。',True),ModelReply('第二段正文。',True),ModelReply('最后的结论。')]
